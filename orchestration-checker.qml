@@ -12,7 +12,7 @@ import "analyse.js" as A
 import "strings.js" as S
 
 MuseScore {
-    menuPath: "Plugins.Orchestration Checker.Check strings"
+    menuPath: "Plugins.Playability Checker.Check strings (once)"
     description: "Marks open strings and flags unplayable multiple stops on bowed string staves."
     version: "0.1"
     requiresScore: true
@@ -36,7 +36,7 @@ MuseScore {
                      (c.div ? " · " + c.div + " skipped (div.)" : "") +
                      (c.harmonics ? " · " + c.harmonics + " harmonics skipped" : "") +
                      (applied.skipped ? " · " + applied.skipped + " left alone (own colour)" : "");
-        console.log("OrchestrationChecker: " + statusLine + " — " + out.rows.length + " flagged");
+        console.log("PlayabilityChecker: " + statusLine + " — " + out.rows.length + " flagged");
     }
 
     function runClear() {
@@ -53,7 +53,7 @@ MuseScore {
         spacing: 10
 
         Text {
-            text: "Orchestration Checker — strings"
+            text: "Playability Checker — strings"
             font.pixelSize: 16; font.bold: true
         }
         Text {

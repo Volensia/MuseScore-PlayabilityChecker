@@ -1,0 +1,7 @@
+# Generated plugin files — build them with `python3 bundle.py`.
+# The sources are the .qml and .js files beside it; dist/ is just those inlined.
+dist/
+
+# Python bytecode
+__pycache__/
+*.pyc

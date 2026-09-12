@@ -16,7 +16,7 @@ import "analyse.js" as A
 import "strings.js" as S
 
 MuseScore {
-    menuPath: "Plugins.Orchestration Checker.Live check (strings)"
+    menuPath: "Plugins.Playability Checker.Live check (strings)"
     description: "Checks bowed-string staves while you edit: open strings, and multiple stops that can't be played."
     version: "0.2"
     requiresScore: true
@@ -65,7 +65,7 @@ MuseScore {
                      c.open + " open · " + c.playable + " playable" +
                      (c.div ? " · " + c.div + " skipped (div.)" : "") +
                      (applied.skipped ? " · " + applied.skipped + " own colour kept" : "");
-        console.log("OrchestrationChecker live: pass " + passes +
+        console.log("PlayabilityChecker live: pass " + passes +
                     (range ? " bars " + range.from + "–" + range.to : " (whole score)") +
                     (command ? " [undoable]" : " [no undo step]") + " — " + statusLine);
     }
@@ -109,7 +109,7 @@ MuseScore {
 
         RowLayout {
             Layout.fillWidth: true
-            Text { text: "Live string check"; font.pixelSize: 14; font.bold: true }
+            Text { text: "Playability Checker — live"; font.pixelSize: 14; font.bold: true }
             Item { Layout.fillWidth: true }
             CheckBox {
                 id: liveBox
