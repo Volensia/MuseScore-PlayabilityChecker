@@ -20,13 +20,26 @@ MuseScore {
     width: 640
     height: 460
 
-    property var env: ({ CHORD: Element.CHORD, DIAMOND: NoteHeadGroup.HEAD_DIAMOND })
+    property var env: ({ CHORD: Element.CHORD, DIAMOND: NoteHeadGroup.HEAD_DIAMOND,
+                         INSTRUMENT_CHANGE: Element.INSTRUMENT_CHANGE,
+                         ARTICULATION: Element.ARTICULATION })
+
+    // Harmonic circles from the Articulations palette are only reachable through
+    // the selection, so this borrows the selection and puts it back.
+    function circleMap() {
+        if (!curScore) return null;
+        var keep = A.saveSelection(curScore);
+        cmd("select-all");
+        var map = A.buildCircleMap(curScore.selection.elements, env);
+        A.restoreSelection(curScore, keep);
+        return map;
+    }
     property string statusLine: ""
 
     ListModel { id: results }
 
     function runCheck() {
-        var out = A.analyse(curScore, env);
+        var out = A.analyse(curScore, env, null, circleMap());
         var applied = A.applyMarks(curScore, out.marks);
         results.clear();
         for (var i = 0; i < out.rows.length; i++) results.append(out.rows[i]);
@@ -34,7 +47,8 @@ MuseScore {
         statusLine = c.open + " open · " + c.playable + " playable · " +
                      c.outOfReach + " out of reach · " + c.impossible + " impossible" +
                      (c.div ? " · " + c.div + " skipped (div.)" : "") +
-                     (c.harmonics ? " · " + c.harmonics + " harmonics skipped" : "") +
+                     (c.harmonics ? " · " + c.harmonics + " harmonics (" +
+                                    (c.harmBad + c.harmRisky) + " flagged)" : "") +
                      (applied.skipped ? " · " + applied.skipped + " left alone (own colour)" : "");
         console.log("PlayabilityChecker: " + statusLine + " — " + out.rows.length + " flagged");
     }

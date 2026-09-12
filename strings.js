@@ -6,8 +6,20 @@
 // Sources (Adler, The Study of Orchestration, 3rd ed.):
 //   open strings and string numbering ............ p. 9 (Ex 2-1…2-5), p. 44
 //   adjacent strings, one note per string ........ p. 11
-//   hand frame: vn/va a 4th, vc a 3rd, cb a 2nd .. p. 10, p. 76, p. 85
 //   double bass needs an open string ............. p. 11 (Ex 2-10), p. 86
+//
+// Hand stretch (Forsyth, Orchestration, Macmillan 1914) — quantified per
+// instrument, and explicitly limited to the lower positions:
+//   vn  p. 357 fn  same string 1st–4th = aug 4th; across strings = minor 9th
+//                  "These restrictions ... apply only to the lower positions."
+//   va  p. 391     "reduced respectively to a perfect fourth and an octave"
+//   vc  p. 425     same string major 3rd; across strings minor 7th
+//   cb  p. 441     "when the hand is closest to the nut the maximum stretch
+//                  between the 1st and 4th fingers is only a whole-tone"
+//   vn  p. 319     "double-stops above the 3rd position are practically unknown"
+// Corroboration for the position effect: Galamian's hand "frame" gets smaller
+// the higher up the fingerboard you play — Simon Fischer, "Basics: Changing
+// position", The Strad, July 2011, p. 1.
 .pragma library
 
 // Deliberately the same two colours MuseScore itself paints on notes outside an
@@ -35,12 +47,27 @@ function isOurColor(c) {
 }
 
 // strings: sounding MIDI, string I (highest) first.
+//
+// span0    the 1st–4th finger stretch on ONE string, at the nut, in semitones.
+//          Forsyth's headline figure. Not used by the multiple-stop rules (each
+//          note of a stop is on its own string) but kept as the sourced anchor.
+// crossMax how much further up the neck the higher string may be stopped than
+//          its neighbour, at the nut, in semitones. Forsyth gives this as a
+//          sounding interval with the 1st finger on the lower string and the 4th
+//          on the next higher one, so the tuning gap comes off:
+//              vn  minor 9th 13 − P5 7 = 6      va  octave 12 − 7 = 5
+//              vc  minor 7th 10 − P5 7 = 3
+//          The bass is the exception: Forsyth gives no interval for it, so it
+//          reuses its same-string whole tone (derived, conservative).
 var INSTRUMENTS = {
-    "strings.violin":     { name: "Violin",      strings: [76, 69, 62, 55], frame: 5 },
-    "strings.viola":      { name: "Viola",       strings: [69, 62, 55, 48], frame: 5 },
-    "strings.cello":      { name: "Cello",       strings: [57, 50, 43, 36], frame: 4 },
-    "strings.contrabass": { name: "Double bass", strings: [43, 38, 33, 28], frame: 2,
-                            requireOpenString: true }
+    "strings.violin":     { name: "Violin",      strings: [76, 69, 62, 55],
+                            span0: 6, crossMax: 6 },
+    "strings.viola":      { name: "Viola",       strings: [69, 62, 55, 48],
+                            span0: 5, crossMax: 5 },
+    "strings.cello":      { name: "Cello",       strings: [57, 50, 43, 36],
+                            span0: 4, crossMax: 3 },
+    "strings.contrabass": { name: "Double bass", strings: [43, 38, 33, 28],
+                            span0: 2, crossMax: 2, requireOpenString: true }
 };
 
 // Fallback when instrumentId is missing or unusual: match the part's long name.
@@ -62,6 +89,9 @@ function lookup(instrumentId, longName) {
     return null;
 }
 
+// one decimal, no trailing ".0" — the Python cross-check model formats to match
+function fmtReach(x) { return String(Math.round(x * 10) / 10); }
+
 var NAMES = ["C", "C#", "D", "Eb", "E", "F", "F#", "G", "Ab", "A", "Bb", "B"];
 function noteName(pitch) { return NAMES[pitch % 12] + (Math.floor(pitch / 12) - 1); }
 var ROMAN = ["I", "II", "III", "IV", "V"];
@@ -77,10 +107,32 @@ function openStringIndex(instr, pitch) {
 // One note per string, all on adjacent strings, highest note on the highest of
 // them: so an assignment is a window of consecutive string indices.
 
+// How far the hand can reach, in semitones of fingerboard offset, when its
+// nearest stopped note sits `pos` semitones above the open string.
+//
+// Stopping points follow x(n) = L(1 − 2^(−n/12)), so one physical hand span
+// covers MORE semitones the higher the hand sits. That is why Forsyth's limits
+// "apply only to the lower positions" (p. 357) and why Galamian's frame "gets
+// smaller the higher up the fingerboard you play" (Fischer, The Strad, 7/2011).
+//
+// The string length cancels: H/L = 1 − 2^(−crossMax/12), so no mensur estimate
+// enters the rules. At pos = 0 this returns crossMax exactly.
+function reachAt(instr, pos) {
+    if (!(pos > 0)) return instr.crossMax;
+    var r = Math.pow(2, -pos / 12) - 1 + Math.pow(2, -instr.crossMax / 12);
+    if (r <= 0.03) return 24;                           // hand is far up: unrestricted
+    return (-12 * Math.log(r) / Math.LN2) - pos;
+}
+
 function stretchOf(instr, pitches, assign) {
-    var stopped = 0, worst = 0;
-    for (var i = 0; i < pitches.length; i++)
-        if (pitches[i] - instr.strings[assign[i]] > 0) stopped++;
+    var stopped = 0, worst = 0, lowest = -1;
+    for (var i = 0; i < pitches.length; i++) {
+        var off = pitches[i] - instr.strings[assign[i]];
+        if (off > 0) {
+            stopped++;
+            if (lowest < 0 || off < lowest) lowest = off;   // where the hand sits
+        }
+    }
     for (var j = 0; j + 1 < pitches.length; j++) {
         var a = pitches[j] - instr.strings[assign[j]];
         var b = pitches[j + 1] - instr.strings[assign[j + 1]];
@@ -88,7 +140,7 @@ function stretchOf(instr, pitches, assign) {
         var d = Math.abs(a - b);
         if (d > worst) worst = d;
     }
-    return { stopped: stopped, worst: worst };
+    return { stopped: stopped, worst: worst, position: lowest < 0 ? 0 : lowest };
 }
 
 // pitches must be descending. Returns:
@@ -103,7 +155,7 @@ function analyseStop(instr, pitches) {
         return { verdict: "impossible", assign: orphanAssign(instr, pitches),
                  reason: "more notes than strings", worst: 0 };
 
-    var best = null, bestCost = null, reach = null, reachCost = null;
+    var best = null, bestCost = null, reach = null, reachCost = null, reachAllow = 0;
     for (var top = 0; top + n <= nStrings; top++) {
         var assign = [], ok = true;
         for (var k = 0; k < n; k++) {
@@ -112,9 +164,12 @@ function analyseStop(instr, pitches) {
         }
         if (!ok) continue;
         var cost = stretchOf(instr, pitches, assign);
-        if (cost.worst <= instr.frame) {
+        var allow = reachAt(instr, cost.position);      // position-aware, see reachAt
+        if (cost.worst <= allow) {
             if (!best || cost.stopped < bestCost.stopped) { best = assign; bestCost = cost; }
-        } else if (!reach || cost.worst < reachCost.worst) { reach = assign; reachCost = cost; }
+        } else if (!reach || cost.worst - allow < reachCost.worst - reachAllow) {
+            reach = assign; reachCost = cost; reachAllow = allow;   // least over the limit
+        }
     }
 
     if (best) {
@@ -125,7 +180,8 @@ function analyseStop(instr, pitches) {
     }
     if (reach)
         return { verdict: "outOfReach", assign: reach, worst: reachCost.worst,
-                 reason: "stretch " + reachCost.worst + " st" };
+                 reason: "stretch " + reachCost.worst + " st, max " +
+                         fmtReach(reachAllow) + " here" };
 
     var partial = orphanAssign(instr, pitches);
     return { verdict: "impossible", assign: partial.assign, reason: partial.reason, worst: 0 };

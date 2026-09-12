@@ -30,7 +30,7 @@ import os, re
 HERE = os.path.dirname(os.path.abspath(__file__))
 PLUGIN = HERE                       # this script sits in the plugin folder
 DIST = os.path.join(HERE, 'dist')
-MODULES = [('S', 'strings.js'), ('A', 'analyse.js')]
+MODULES = [('S', 'strings.js'), ('H', 'harmonics.js'), ('A', 'analyse.js')]
 LIB = 'lib'
 # source file  ->  name to publish it under in dist/
 QMLS = [('orchestration-checker-live.qml', 'PlayabilityChecker.qml'),

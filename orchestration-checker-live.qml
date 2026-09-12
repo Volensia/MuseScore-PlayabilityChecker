@@ -25,7 +25,10 @@ MuseScore {
     width: 340
     height: 520
 
-    property var env: ({ CHORD: Element.CHORD, DIAMOND: NoteHeadGroup.HEAD_DIAMOND })
+    property var env: ({ CHORD: Element.CHORD, DIAMOND: NoteHeadGroup.HEAD_DIAMOND,
+                         INSTRUMENT_CHANGE: Element.INSTRUMENT_CHANGE,
+                         ARTICULATION: Element.ARTICULATION })
+    property var circles: null          // "track|tick" -> true, rebuilt on full checks
     property bool liveOn: true
     property bool busy: false           // re-entry guard: our own writes fire onScoreStateChanged
     property int passes: 0
@@ -34,12 +37,27 @@ MuseScore {
 
     ListModel { id: results }
 
-    function check(range, command) {
+    // Circles from the Articulations palette can only be found with a select-all,
+    // which means borrowing the selection. A range selection cannot be restored
+    // faithfully (startSegment/endSegment read back as null), so doing this
+    // automatically made editing unusable: every typed note lost its selection.
+    // It now runs ONLY on an explicit action — plugin start, Re-check, Apply.
+    // Circles from the Symbols palette need none of this and stay fully live.
+    function rebuildCircles() {
+        if (!curScore) return;
+        var keep = A.saveSelection(curScore);
+        cmd("select-all");
+        circles = A.buildCircleMap(curScore.selection.elements, env);
+        A.restoreSelection(curScore, keep);
+    }
+
+    function check(range, command, scanCircles) {
         if (!curScore) return;
         busy = true;
+        if (scanCircles) rebuildCircles();       // never on an automatic pass
         A.clearMarks(curScore, env, { command: command, from: range ? range.from : -1,
                                                         to:   range ? range.to   : -1 });
-        var out = A.analyse(curScore, env, range);
+        var out = A.analyse(curScore, env, range, circles);
         var applied = A.applyMarks(curScore, out.marks, { command: command });
         busy = false;
         passes++;
@@ -64,19 +82,22 @@ MuseScore {
         statusLine = c.impossible + " unplayable · " + c.outOfReach + " stretch · " +
                      c.open + " open · " + c.playable + " playable" +
                      (c.div ? " · " + c.div + " skipped (div.)" : "") +
+                     (c.harmonics ? " · " + c.harmonics + " harmonics (" +
+                                    (c.harmBad + c.harmRisky) + " flagged)" : "") +
                      (applied.skipped ? " · " + applied.skipped + " own colour kept" : "");
         console.log("PlayabilityChecker live: pass " + passes +
                     (range ? " bars " + range.from + "–" + range.to : " (whole score)") +
                     (command ? " [undoable]" : " [no undo step]") + " — " + statusLine);
     }
 
-    function fullCheck(command) { check(null, command); }
+    function fullCheck(command) { check(null, command, true); }
 
     onScoreStateChanged: {
         if (busy || !liveOn) return;
         if (!curScore) return;
         if (curScore.scoreName !== lastScore) {     // switched tab: start over
             lastScore = curScore.scoreName;
+            circles = null;             // the old score's map does not apply here
             debounce.range = null;
             debounce.restart();
             return;
@@ -96,6 +117,10 @@ MuseScore {
         property var range: null
         onTriggered: check(range, false)            // live: no undo step
     }
+
+    // There is deliberately no timer that scans for harmonic circles. It needs a
+    // select-all, and the selection cannot be handed back intact, so running it
+    // on any automatic schedule fights the person typing.
 
     onRun: {
         if (curScore) lastScore = curScore.scoreName;
@@ -154,7 +179,11 @@ MuseScore {
         RowLayout {
             Layout.fillWidth: true
             spacing: 6
-            Button { text: "Re-check"; onClicked: fullCheck(false) }
+            Button {
+                text: "Re-check"
+                tooltip: "Also scans for harmonic circles added from the Articulations palette"
+                onClicked: fullCheck(false)
+            }
             Button {
                 text: "Apply to score"
                 tooltip: "Write the same colours as a normal, undoable edit"

@@ -16,6 +16,7 @@
 // turns up inside the edited range.
 .pragma library
 .import "strings.js" as S
+.import "harmonics.js" as H
 
 function barMap(score) {
     var starts = [], m = score.firstMeasure;
@@ -31,18 +32,17 @@ function barOf(starts, tick) {
     return bar;
 }
 
-// staffIdx -> { instr, name }
+// staffIdx -> { part, name }. The instrument itself is resolved per tick, since a
+// staff can change instrument part-way through (see "instrument changes" below).
 function staffInstruments(score) {
     var map = [];
     for (var p = 0; p < score.parts.length; p++) {
         var part = score.parts[p];
-        var id = "", ln = "";
-        try { id = part.instrumentId } catch (e) {}
+        var ln = "";
         try { ln = part.longName || part.partName || "" } catch (e) {}
-        var instr = S.lookup(id, ln);
         var first = part.startTrack >> 2, last = part.endTrack >> 2;
         for (var s = first; s < last; s++)
-            map[s] = { instr: instr, name: ln || ("staff " + (s + 1)) };
+            map[s] = { part: part, name: ln || ("staff " + (s + 1)) };
     }
     return map;
 }
@@ -125,33 +125,223 @@ function divAt(changes, tick) {
     return on;
 }
 
+// --- instrument changes --------------------------------------------------
+// A player can double: one staff starts as a violin and becomes a flute, or the
+// reverse. part.instrumentAtTick() resolves the instrument at a point in time,
+// and the change itself sits in segment.annotations as Element.INSTRUMENT_CHANGE.
+// Both were verified on 3.6.2 against a score with a "to Flute" change: the part
+// reports the violin before the change tick and the flute at and after it.
+//
+// Cached per staff like the div. map, and rebuilt only when an instrument change
+// turns up inside the edited range.
+var _instrCache = {};
+
+function invalidateInstrCache() { _instrCache = {}; }
+
+function annotationTypeInRange(score, staffIdx, type, from, to) {
+    if (type === undefined || type === null) return false;
+    var cur = score.newCursor();
+    cur.staffIdx = staffIdx; cur.voice = 0;
+    seek(cur, from);
+    while (cur.segment && (to < 0 || cur.tick <= to)) {
+        var ann = cur.segment.annotations;
+        if (ann)
+            for (var a = 0; a < ann.length; a++) {
+                var el = ann[a], tr = -1;
+                try { tr = el.track } catch (e) {}
+                if ((tr >> 2) !== staffIdx) continue;
+                if (el.type === type) return true;
+            }
+        cur.next();
+    }
+    return false;
+}
+
+function scanInstruments(score, env, staffIdx, part) {
+    var ticks = [0], cur = score.newCursor();
+    cur.staffIdx = staffIdx; cur.voice = 0; cur.rewind(0);
+    while (cur.segment) {
+        var ann = cur.segment.annotations;
+        if (ann)
+            for (var a = 0; a < ann.length; a++) {
+                var el = ann[a], tr = -1;
+                try { tr = el.track } catch (e) {}
+                if ((tr >> 2) !== staffIdx) continue;
+                if (el.type === env.INSTRUMENT_CHANGE && ticks.indexOf(cur.tick) < 0)
+                    ticks.push(cur.tick);
+            }
+        cur.next();
+    }
+    var out = [];
+    for (var i = 0; i < ticks.length; i++) {
+        var id = "", ln = "";
+        try {
+            var ins = part.instrumentAtTick(ticks[i]);
+            try { id = ins.instrumentId || "" } catch (e2) {}
+            try { ln = ins.longName || "" } catch (e3) {}
+        } catch (e) {}
+        if (!id && !ln) {                       // fall back to the part's own instrument
+            try { id = part.instrumentId || "" } catch (e4) {}
+            try { ln = part.longName || part.partName || "" } catch (e5) {}
+        }
+        out.push({ tick: ticks[i], instr: S.lookup(id, ln) });
+    }
+    return out;
+}
+
+function instrumentsOf(score, env, staffIdx, part, range) {
+    var key = score.scoreName + "|" + staffIdx;
+    var cached = _instrCache[key];
+    var ranged = range && range.from >= 0;
+    if (cached && ranged &&
+        !annotationTypeInRange(score, staffIdx, env.INSTRUMENT_CHANGE, range.from, range.to))
+        return cached;
+    var fresh = scanInstruments(score, env, staffIdx, part);
+    _instrCache[key] = fresh;
+    return fresh;
+}
+
+function instrAt(list, tick) {
+    var instr = null;
+    for (var i = 0; i < list.length; i++) {
+        if (list[i].tick <= tick) instr = list[i].instr; else break;
+    }
+    return instr;
+}
+
+// --- harmonic circles ----------------------------------------------------
+// A harmonic written as a circle over the sounding note is an Articulation on
+// the Chord, and the Chord will not hand it over — score.selection.elements
+// after a select-all is the only way to reach it (verified on 3.6.2). So the
+// caller does the select-all (cmd() lives on the MuseScore object, not here),
+// hands us the element list, and we return a { "track|tick": true } map.
+//
+// Cost on 16 staves x 300 bars: select-all 26 ms, scanning 54,638 elements
+// 177 ms. Fine once per check, too slow for every live keystroke — so the
+// plugins build it on full checks and reuse it for ranged passes.
+// Saving and restoring the selection, measured on 3.6.2:
+//   a LIST selection (what you have after typing a note, or clicking notes) is
+//     fully restorable — select(el) then select(el, true) for the rest rebuilds
+//     it exactly, verified by round-tripping two notes through a select-all.
+//   a RANGE selection is NOT reliably restorable: startSegment and endSegment
+//     read back as null, so its tick bounds often cannot be captured at all.
+//   endStaff is EXCLUSIVE — one staff reads startStaff=1, endStaff=2. An earlier
+//     version added 1 to it and silently widened the user's selection by a staff.
+function saveSelection(score) {
+    try {
+        var s = score.selection, keep = { isRange: s.isRange, elements: [] };
+        if (s.isRange) {
+            keep.startStaff = s.startStaff;
+            keep.endStaff = s.endStaff;             // already exclusive
+            keep.from = -1;
+            keep.to = -1;
+            try { if (s.startSegment) keep.from = s.startSegment.tick } catch (e) {}
+            try { if (s.endSegment) keep.to = s.endSegment.tick } catch (e2) {}
+        } else {
+            var els = s.elements;
+            if (els) for (var i = 0; i < els.length; i++) keep.elements.push(els[i]);
+        }
+        return keep;
+    } catch (e3) { return null; }
+}
+
+function restoreSelection(score, keep) {
+    if (!keep) return;
+    try {
+        var s = score.selection;
+        s.clear();
+        if (keep.isRange) {
+            if (keep.from >= 0 && keep.to >= 0)     // verbatim: endStaff is exclusive
+                s.selectRange(keep.from, keep.to, keep.startStaff, keep.endStaff);
+            return;
+        }
+        for (var i = 0; i < keep.elements.length; i++)
+            s.select(keep.elements[i], i > 0);      // i > 0 adds to the selection
+    } catch (e) {}
+}
+
+function buildCircleMap(elements, env) {
+    var map = {};
+    if (!elements) return map;
+    for (var i = 0; i < elements.length; i++) {
+        var el = elements[i], sym = null;
+        if (el.type !== env.ARTICULATION) continue;
+        try { sym = el.symbol } catch (e) {}
+        if (!H.isHarmonicSymbol(sym)) continue;     // symbol is an object, not a Number
+        var chord = null, seg = null, tick = -1, tr = -1;
+        try { chord = el.parent } catch (e2) {}
+        if (!chord) continue;
+        try { seg = chord.parent } catch (e3) {}
+        try { tick = seg.tick } catch (e4) {}
+        try { tr = chord.track } catch (e5) {}
+        if (tick >= 0 && tr >= 0) map[tr + "|" + tick] = true;
+    }
+    return map;
+}
+
 // --- analysis ------------------------------------------------------------
 // env  : { CHORD: Element.CHORD, DIAMOND: NoteHeadGroup.HEAD_DIAMOND }
 // range: optional { from, to } in ticks — live mode passes the layout range of
 //        the edit so only the affected bars are re-examined.
 // Returns { rows, marks, counts }. Nothing is written to the score here.
-function analyse(score, env, range) {
+function analyse(score, env, range, circles) {
     var starts = barMap(score), staves = staffInstruments(score);
     var rows = [], marks = [];
-    var counts = { open: 0, playable: 0, outOfReach: 0, impossible: 0, div: 0, harmonics: 0 };
+    var counts = { open: 0, playable: 0, outOfReach: 0, impossible: 0, div: 0,
+                   harmonics: 0, harmRisky: 0, harmBad: 0 };
     var from = range && range.from >= 0 ? range.from : -1;
     var to   = range && range.to   >= 0 ? range.to   : -1;
 
     for (var st = 0; st < score.nstaves; st++) {
         var info = staves[st];
-        if (!info || !info.instr) continue;
-        var instr = info.instr;
+        if (!info) continue;
+        var instrList = instrumentsOf(score, env, st, info.part, range);
+        var anyString = false;
+        for (var ai = 0; ai < instrList.length; ai++) if (instrList[ai].instr) anyString = true;
+        if (!anyString) continue;               // never a bowed string staff
         var changes = divChanges(score, st, range);
 
         // one chord (ordinary or grace): mark it and, if it is a stop, judge it
         var handle = function (chordEl, tick) {
-            var ns = chordEl.notes, list = [], harmonic = false;
-            for (var i = 0; i < ns.length; i++) {
-                if (ns[i].headGroup === env.DIAMOND) { harmonic = true; break; }
-                list.push({ note: ns[i], pitch: ns[i].pitch });
+            var instr = instrAt(instrList, tick);
+            if (!instr) return;                 // staff is a non-string instrument here
+            // a circle from the Articulations palette belongs to the whole chord
+            var chordCircle = false;
+            if (circles) {
+                var ctr = -1;
+                try { ctr = chordEl.track } catch (e) {}
+                if (ctr >= 0 && circles[ctr + "|" + tick]) chordCircle = true;
             }
-            if (harmonic) { counts.harmonics++; return; }
+
+            var ns = chordEl.notes, list = [], anyD = false, anyC = chordCircle;
+            for (var i = 0; i < ns.length; i++) {
+                var isD = ns[i].headGroup === env.DIAMOND;
+                var isC = chordCircle || H.hasCircle(ns[i]);
+                if (isD) anyD = true;
+                if (isC) anyC = true;
+                list.push({ note: ns[i], pitch: ns[i].pitch, diamond: isD, circle: isC });
+            }
             if (!list.length) return;
+
+            // S7/S8: harmonics get their own check, and are never run through the
+            // multiple-stop test — an artificial harmonic is not a double stop.
+            if (anyD || anyC) {
+                var h = H.classify(instr, list);
+                if (h) {
+                    counts.harmonics++;
+                    if (h.verdict !== "ok") {
+                        var hc = h.verdict === "impossible" ? S.COLOR.impossible
+                                                            : S.COLOR.outOfReach;
+                        if (h.verdict === "impossible") counts.harmBad++;
+                        else counts.harmRisky++;
+                        for (var hi = 0; hi < list.length; hi++)
+                            marks.push({ note: list[hi].note, color: hc });
+                        rows.push({ bar: barOf(starts, tick), tick: tick, staff: info.name,
+                                    verdict: h.verdict, reason: h.reason, notes: h.detail });
+                    }
+                    return;
+                }
+            }
 
             if (list.length === 1) {
                 if (S.openStringIndex(instr, list[0].pitch) >= 0) {
