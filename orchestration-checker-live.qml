@@ -12,8 +12,10 @@ import QtQuick 2.2
 import QtQuick.Controls 1.1
 import QtQuick.Layouts 1.1
 import MuseScore 3.0
+import FileIO 3.0
 import "analyse.js" as A
 import "strings.js" as S
+import "fingerboard.js" as F
 
 MuseScore {
     menuPath: "Plugins.Playability Checker.Live check (strings)"
@@ -25,12 +27,58 @@ MuseScore {
     width: 340
     height: 520
 
-    property var env: ({ CHORD: Element.CHORD, DIAMOND: NoteHeadGroup.HEAD_DIAMOND,
+    property var env: ({ CHORD: Element.CHORD, NOTE: Element.NOTE,
+                         DIAMOND: NoteHeadGroup.HEAD_DIAMOND,
+                         NORMAL: NoteHeadGroup.HEAD_NORMAL,
                          INSTRUMENT_CHANGE: Element.INSTRUMENT_CHANGE,
-                         ARTICULATION: Element.ARTICULATION })
+                         ARTICULATION: Element.ARTICULATION,
+                         SYM: { black: SymId.noteheadBlack, half: SymId.noteheadHalf,
+                                whole: SymId.noteheadWhole, breve: SymId.noteheadDoubleWhole,
+                                diamondBlack: SymId.noteheadDiamondBlack,
+                                diamondHalf: SymId.noteheadDiamondHalf,
+                                diamondWhole: SymId.noteheadDiamondWhole,
+                                diamondBreve: SymId.noteheadDiamondDoubleWhole } })
+
+    // Instrument ranges, read from a temp copy of the score (the plugin API has no
+    // range properties). Needed to know which notes MuseScore paints over.
+    property var ranges: null
+    property var covers: []             // keys of notes drawn over, for selection changes
+    property bool coverOn: true         // draw our colour over MuseScore's range colours
+    FileIO { id: rangeFile }
+
+    function readRanges() {
+        if (!curScore || !coverOn) { ranges = null; return; }
+        var base = rangeFile.tempPath() + "/playability-checker-ranges";
+        busy = true;
+        var ok = writeScore(curScore, base, "mscx");   // a copy: the score keeps its name
+        busy = false;
+        if (!ok) { ranges = null; return; }
+        rangeFile.source = base + ".mscx";
+        ranges = A.parseRanges(rangeFile.read());
+    }
+
+    function overlayOpts(command) {
+        return { command: command, overlay: coverOn, env: env,
+                 newSymbol: function () { return newElement(Element.SYMBOL); } };
+    }
     property var circles: null          // "track|tick" -> true, rebuilt on full checks
     property bool liveOn: true
     property bool busy: false           // re-entry guard: our own writes fire onScoreStateChanged
+    property bool syncing: false        // the panel itself is moving a selection
+    property bool rebuilding: false     // the results model is being refilled
+    property string rowsScore: ""       // the score the rows belong to
+    property string selectedInfo: ""    // the "Selected" line under the table
+    property var geom: null             // fingerboard data while a playable chord is selected
+    property bool showList: false       // the user asked for the list back
+
+    // TEMPORARY: says where the fingerboard fails, if it does. Remove once it is seen working.
+    property string debugInfo: selectedInfo === "" ? "" :
+        ("fingerboard " + (geom !== null ? "recognised" : "not recognised") +
+         " · " + (board.items ? board.items.length : 0) + " shapes" +
+         " · area " + Math.round(listArea.width) + "×" + Math.round(listArea.height) +
+         " · diagram " + Math.round(board.width) + "×" + Math.round(board.height) +
+         " · shown " + board.visible + (showList ? " (list chosen)" : ""))
+
     property int passes: 0
     property string statusLine: "not run yet"
     property string lastScore: ""
@@ -55,21 +103,34 @@ MuseScore {
         if (!curScore) return;
         busy = true;
         if (scanCircles) rebuildCircles();       // never on an automatic pass
+        busy = false;
+        if (coverOn && (scanCircles || ranges === null)) readRanges();
+        busy = true;
         A.clearMarks(curScore, env, { command: command, from: range ? range.from : -1,
                                                         to:   range ? range.to   : -1 });
-        var out = A.analyse(curScore, env, range, circles);
-        var applied = A.applyMarks(curScore, out.marks, { command: command });
+        var out = A.analyse(curScore, env, range, circles, coverOn ? ranges : null);
+        var applied = A.applyMarks(curScore, out.marks, overlayOpts(command));
         busy = false;
         passes++;
 
+        // covered notes: a partial pass replaces only the keys inside its range
+        var keepCovers = [];
+        if (range && range.from >= 0)
+            for (var ci = 0; ci < covers.length; ci++)
+                if (covers[ci].tick < range.from || covers[ci].tick > range.to)
+                    keepCovers.push(covers[ci]);
+        covers = keepCovers.concat(out.covers);
+
         // a partial pass only replaces the rows in its own bar range
+        rebuilding = true;
         if (range && range.from >= 0) {
             var kept = [];
             for (var i = 0; i < results.count; i++) {
                 var r = results.get(i);
                 if (r.tick < range.from || r.tick > range.to)
                     kept.push({ bar: r.bar, tick: r.tick, staff: r.staff,
-                                verdict: r.verdict, reason: r.reason, notes: r.notes });
+                                verdict: r.verdict, reason: r.reason, notes: r.notes,
+                                track: r.track, grace: r.grace });
             }
             results.clear();
             for (var k = 0; k < kept.length; k++) results.append(kept[k]);
@@ -77,6 +138,9 @@ MuseScore {
             results.clear();
         }
         for (var j = 0; j < out.rows.length; j++) results.append(out.rows[j]);
+        rebuilding = false;
+        rowsScore = curScore.scoreName;
+        syncFromScore();                    // keep the highlight on what is selected
 
         var c = out.counts;
         statusLine = c.impossible + " unplayable · " + c.outOfReach + " stretch · " +
@@ -84,7 +148,8 @@ MuseScore {
                      (c.div ? " · " + c.div + " skipped (div.)" : "") +
                      (c.harmonics ? " · " + c.harmonics + " harmonics (" +
                                     (c.harmBad + c.harmRisky) + " flagged)" : "") +
-                     (applied.skipped ? " · " + applied.skipped + " own colour kept" : "");
+                     (applied.skipped ? " · " + applied.skipped + " own colour kept" : "") +
+                     (c.covered ? " · " + c.covered + " drawn over MuseScore's range colour" : "");
         console.log("PlayabilityChecker live: pass " + passes +
                     (range ? " bars " + range.from + "–" + range.to : " (whole score)") +
                     (command ? " [undoable]" : " [no undo step]") + " — " + statusLine);
@@ -92,16 +157,88 @@ MuseScore {
 
     function fullCheck(command) { check(null, command, true); }
 
-    onScoreStateChanged: {
-        if (busy || !liveOn) return;
+    // Score -> panel: highlight the row for the selected chord, and describe it.
+    // Rows and chords name each other by { track, tick, grace } — see analyse.js.
+    function syncFromScore() {
         if (!curScore) return;
+        var key = A.selectedChord(curScore, env);
+        selectedInfo = key ? A.inspectChord(curScore, env, key, circles) : "";
+        geom = key ? A.chordGeometry(curScore, env, key, circles) : null;
+        showList = false;
+        // a selected note shows MuseScore's selection colour, so uncover it
+        if (coverOn && covers.length) {
+            busy = true;
+            A.refreshCovers(curScore, env, covers, overlayOpts(false));
+            busy = false;
+        }
+        var row = -1;
+        if (key && curScore.scoreName === rowsScore) {
+            for (var i = 0; i < results.count; i++) {
+                var r = results.get(i);
+                if (r.track === key.track && r.tick === key.tick && r.grace === key.grace) {
+                    row = i;
+                    break;
+                }
+            }
+        }
+        syncing = true;
+        table.selection.clear();
+        if (row >= 0) {
+            table.selection.select(row);
+            table.currentRow = row;
+            table.positionViewAtRow(row, ListView.Contain);
+        } else {
+            table.currentRow = -1;
+        }
+        syncing = false;
+    }
+
+    // Panel -> score: select the chord a row points at. Only ever called from a
+    // click, never from a model change, so a live pass cannot move the selection.
+    // Scroll the score to a chord. A plugin's selection.select() never pans; MuseScore
+    // only scrolls inside view commands. "top-chord" (Ctrl+Alt+Up) runs cmdGotoElement
+    // on the chord's own top note (Score::upAltCtrl = chord->upNote()), which selects it
+    // and calls adjustCanvasPosition (scoreview.cpp:2050-2066, 2411). The caller then
+    // re-selects the whole chord. Side effect: with "play notes when editing" on, the
+    // note may sound.
+    function panToChord(r) {
+        var ch = A.findChord(curScore, env, r.track, r.tick, r.grace);
+        if (!ch || !ch.notes || !ch.notes.length) return;
+        curScore.selection.clear();
+        curScore.selection.select(ch.notes[0]);
+        cmd("top-chord");
+    }
+
+    function selectRow(row) {
+        if (syncing || rebuilding || !curScore || row < 0 || row >= results.count) return;
+        syncing = true;
+        var r = results.get(row);
+        panToChord({ track: r.track, tick: r.tick, grace: r.grace });
+        var found = A.selectChord(curScore, env, r);
+        syncing = false;
+        if (!found) {
+            selectedInfo = "that chord has changed since the check — press Re-check";
+            return;
+        }
+        var key = A.selectedChord(curScore, env);
+        selectedInfo = key ? A.inspectChord(curScore, env, key, circles) : "";
+        geom = key ? A.chordGeometry(curScore, env, key, circles) : null;   // rows are never playable
+    }
+
+    onScoreStateChanged: {
+        if (busy || !curScore) return;
+        if (state.selectionChanged && !syncing) syncFromScore();
+        if (!liveOn) return;
         if (curScore.scoreName !== lastScore) {     // switched tab: start over
             lastScore = curScore.scoreName;
             circles = null;             // the old score's map does not apply here
+            ranges = null;
+            covers = [];
             debounce.range = null;
             debounce.restart();
             return;
         }
+        if (state.instrumentsChanged) ranges = null;    // re-read on the next pass
         // a pure selection change doesn't alter any note
         if (state.selectionChanged && state.startLayoutTick < 0 && !state.instrumentsChanged) return;
         if (state.startLayoutTick >= 0 && state.endLayoutTick >= state.startLayoutTick)
@@ -137,6 +274,16 @@ MuseScore {
             Text { text: "Playability Checker — live"; font.pixelSize: 14; font.bold: true }
             Item { Layout.fillWidth: true }
             CheckBox {
+                text: "cover"
+                checked: true
+                tooltip: "Draw the plugin's colour over notes MuseScore marks as out of range"
+                onCheckedChanged: {
+                    coverOn = checked;
+                    if (!checked) { covers = []; ranges = null; }
+                    fullCheck(false);
+                }
+            }
+            CheckBox {
                 id: liveBox
                 text: "live"
                 checked: true
@@ -166,14 +313,98 @@ MuseScore {
             }
         }
 
-        TableView {
+        // The list and the fingerboard share one container and each fill it with anchors,
+        // so the diagram always has the container's real size the moment it appears —
+        // it does not wait for the column layout to hand space to a newly visible item.
+        Item {
+            id: listArea
             Layout.fillWidth: true
             Layout.fillHeight: true
+            Layout.minimumHeight: 220
+
+        // While a playable chord is selected, its fingerboard replaces the list.
+        // Drawn with plain Rectangles and Text, NOT a Canvas: a QML Canvas paints
+        // through an OpenGL framebuffer by default and stayed blank in the MuseScore
+        // dock, while plain items (like the legend swatches) always render. Every line
+        // in the diagram is horizontal or vertical, so a Rectangle draws it exactly.
+        Item {
+            id: board
+            anchors.fill: parent
+            visible: geom !== null && !showList
+            clip: true
+            property var items: (geom !== null && width > 0 && height > 0)
+                                ? F.layoutFingerboard(geom, width, height) : []
+            Repeater {
+                model: board.items
+                delegate: Item {
+                    property var it: modelData
+                    property bool isLine: it.kind === "line"
+                    property bool vertical: isLine && it.x1 === it.x2
+                    property real lw: it.width || 1
+                    Rectangle {
+                        visible: it.kind !== "text"
+                        x: isLine ? (vertical ? it.x1 - lw / 2 : Math.min(it.x1, it.x2))
+                                  : (it.kind === "circle" ? it.x - it.r : it.x)
+                        y: isLine ? (vertical ? Math.min(it.y1, it.y2) : it.y1 - lw / 2)
+                                  : (it.kind === "circle" ? it.y - it.r : it.y)
+                        width:  isLine ? (vertical ? lw : Math.abs(it.x2 - it.x1))
+                                       : (it.kind === "circle" ? it.r * 2 : (it.w || 0))
+                        height: isLine ? (vertical ? Math.abs(it.y2 - it.y1) : lw)
+                                       : (it.kind === "circle" ? it.r * 2 : (it.h || 0))
+                        radius: it.kind === "circle" ? it.r : 0
+                        color: it.kind === "line" ? it.color
+                             : (it.fill ? it.fill : "transparent")
+                        border.width: (it.kind === "circle" && !it.fill) ? lw : 0
+                        border.color: it.stroke ? it.stroke : "transparent"
+                        opacity: it.opacity !== undefined ? it.opacity : 1
+                    }
+                    Text {
+                        visible: it.kind === "text"
+                        text: it.text || ""
+                        font.pixelSize: it.size || 10
+                        font.bold: !!it.bold
+                        color: it.color || "#333333"
+                        // display-list text coordinates are baselines, as on a canvas
+                        x: it.align === "center" ? it.x - implicitWidth / 2
+                         : it.align === "right" ? it.x - implicitWidth : (it.x || 0)
+                        y: (it.y || 0) - baselineOffset
+                    }
+                }
+            }
+        }
+
+        TableView {
+            id: table
+            visible: geom === null || showList
+            anchors.fill: parent
             model: results
+            // Deliberately NOT onCurrentRowChanged: that also fires when a live pass
+            // refills the model, and would move the selection behind your back.
+            onClicked: selectRow(row)
+            onActivated: selectRow(row)
             TableViewColumn { role: "bar";     title: "Bar";    width: 40 }
             TableViewColumn { role: "staff";   title: "Staff";  width: 80 }
             TableViewColumn { role: "reason";  title: "Reason"; width: 105 }
             TableViewColumn { role: "notes";   title: "Notes";  width: 95 }
+        }
+        }   // listArea
+
+        Text {
+            Layout.fillWidth: true
+            visible: debugInfo !== ""
+            text: "debug — " + debugInfo
+            wrapMode: Text.WordWrap
+            font.pixelSize: 10
+            color: "#8a8a8a"
+        }
+
+        Text {
+            Layout.fillWidth: true
+            visible: selectedInfo !== ""
+            text: "Selected: " + selectedInfo
+            wrapMode: Text.WordWrap
+            font.pixelSize: 11
+            color: "#222222"
         }
 
         RowLayout {
@@ -190,6 +421,12 @@ MuseScore {
                 onClicked: fullCheck(true)
             }
             Item { Layout.fillWidth: true }
+            Button {
+                text: showList ? "Fingerboard" : "List"
+                visible: geom !== null
+                tooltip: "Switch between the fingerboard of the selected chord and the list"
+                onClicked: showList = !showList
+            }
             Button {
                 text: "Clear"
                 onClicked: {

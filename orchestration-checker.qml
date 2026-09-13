@@ -38,6 +38,19 @@ MuseScore {
 
     ListModel { id: results }
 
+    // Select a row's chord and scroll to it: MuseScore only pans inside view commands,
+    // so "top-chord" goes to the chord's own top note first (see the live panel).
+    function selectRow(row) {
+        var r = results.get(row);
+        var ch = A.findChord(curScore, env, r.track, r.tick, r.grace);
+        if (ch && ch.notes && ch.notes.length) {
+            curScore.selection.clear();
+            curScore.selection.select(ch.notes[0]);
+            cmd("top-chord");
+        }
+        A.selectChord(curScore, env, r);
+    }
+
     function runCheck() {
         var out = A.analyse(curScore, env, null, circleMap());
         var applied = A.applyMarks(curScore, out.marks);
@@ -99,6 +112,8 @@ MuseScore {
             Layout.fillWidth: true
             Layout.fillHeight: true
             model: results
+            onClicked: selectRow(row)
+            onActivated: selectRow(row)
             TableViewColumn { role: "bar";     title: "Bar";   width: 45 }
             TableViewColumn { role: "staff";   title: "Staff"; width: 110 }
             TableViewColumn { role: "verdict"; title: "Verdict"; width: 90 }

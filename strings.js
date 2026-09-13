@@ -207,13 +207,19 @@ function orphanAssign(instr, pitches) {
 // Which string do this note and a neighbour both need?
 function sharedString(instr, pitches, i) {
     for (var s = instr.strings.length - 1; s >= 0; s--)
-        if (pitches[i] >= instr.strings[s]) return noteName(instr.strings[s]);
+        if (pitches[i] >= instr.strings[s]) return stringName(instr.strings[s]);
     return "?";
 }
 
+// A string is called by its letter — "the G string" — never "the G3 string".
+// Every standard open string is a natural, so the pitch class is the name.
+function stringName(openPitch) { return NAMES[openPitch % 12]; }
+
+// A chord is named from the bottom note up. pitches (and res.assign) arrive
+// sorted high to low for analyseStop, so walk them backwards.
 function describe(instr, pitches, res) {
     var parts = [];
-    for (var i = 0; i < pitches.length; i++) {
+    for (var i = pitches.length - 1; i >= 0; i--) {
         var s = res.assign ? res.assign[i] : -1;
         parts.push(noteName(pitches[i]) + (s >= 0 ? " (" + ROMAN[s] + ")" : " (—)"));
     }

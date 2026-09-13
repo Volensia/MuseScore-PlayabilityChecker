@@ -30,7 +30,8 @@ import os, re
 HERE = os.path.dirname(os.path.abspath(__file__))
 PLUGIN = HERE                       # this script sits in the plugin folder
 DIST = os.path.join(HERE, 'dist')
-MODULES = [('S', 'strings.js'), ('H', 'harmonics.js'), ('A', 'analyse.js')]
+MODULES = [('S', 'strings.js'), ('H', 'harmonics.js'), ('A', 'analyse.js'),
+           ('F', 'fingerboard.js')]
 LIB = 'lib'
 # source file  ->  name to publish it under in dist/
 QMLS = [('orchestration-checker-live.qml', 'PlayabilityChecker.qml'),
@@ -83,7 +84,7 @@ def build():
     written = []
     for src_name, out_name in QMLS:
         text = open(os.path.join(PLUGIN, src_name)).read()
-        text = re.sub(r'^\s*import\s+"(analyse|strings)\.js"\s+as\s+\w+\s*\n', '', text, flags=re.M)
+        text = re.sub(r'^\s*import\s+"(analyse|strings|harmonics|fingerboard)\.js"\s+as\s+\w+\s*\n', '', text, flags=re.M)
         # qualify module calls before the library is pasted in, so the regex
         # can't reach into the inlined sources
         for prefix, _ in MODULES:
