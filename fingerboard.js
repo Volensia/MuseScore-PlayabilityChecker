@@ -44,40 +44,48 @@ function fingerboardSpan(geom) {
     return Math.max(12, Math.min(36, Math.ceil(top) + 3));
 }
 
+// Size policy: the diagram is only as wide as it needs to be — strings at most
+// FB_MAX_GAP apart, centred — and only as tall as reads well, so it never stretches
+// to fill a big panel and never forces the panel to grow. Below the minimum size it
+// draws nothing rather than overflow.
+var FB_MAX_GAP = 40;
+var FB_MAX_HEIGHT = 420;
+
 function layoutFingerboard(geom, w, h) {
     var items = [];
-    if (!geom || !geom.strings || w < 120 || h < 160) return items;
+    if (!geom || !geom.strings || w < 90 || h < 110) return items;
 
     var n = geom.strings.length;
-    var left = 34, right = 46, top = 88, bottom = 14;
-    var bw = w - left - right, bh = h - top - bottom;
+    var left = 26, right = 34, top = 44, bottom = 10;
+    var avail = w - left - right;
+    var gap = n > 1 ? Math.min(FB_MAX_GAP, avail / (n - 1)) : 0;
+    var x0 = left + Math.max(0, (avail - gap * (n - 1)) / 2);      // centred
+    var bh = Math.min(h, FB_MAX_HEIGHT) - top - bottom;
     var span = fingerboardSpan(geom);
     var norm = 1 - Math.pow(2, -span / 12);
 
     function yAt(semi) { return top + bh * (1 - Math.pow(2, -semi / 12)) / norm; }
-    function xAt(stringIdx) {                  // string I (index 0) is rightmost
-        var col = n - 1 - stringIdx;
-        return left + (n === 1 ? bw / 2 : bw * col / (n - 1));
-    }
+    function xAt(stringIdx) { return x0 + gap * (n - 1 - stringIdx); }   // string I rightmost
     var xLow = xAt(n - 1), xHigh = xAt(0);
+    // In a narrow panel the dots shrink with the string gap, and a note's name is only
+    // drawn when it fits before the next string. The panel shows its Selected line only
+    // when the names are not drawn, so a "meta" item (never painted) reports which.
+    var dotR = Math.max(3.5, Math.min(7, gap * 0.28));
+    var showNames = n === 1 || gap >= 2 * dotR + 24;
+    items.push({ kind: "meta", namesShown: showNames });
 
-    // header: what this is, and the hand position it was judged at
-    items.push({ kind: "text", x: 2, y: 14, text: geom.instrument + " — fingerboard",
-                 size: 12, color: FB_COLOR.text, bold: true, align: "left" });
-    var sub = geom.stopped
-        ? "lowest stop +" + geom.position + " st · hand reaches " +
-          (Math.round(geom.reach * 10) / 10) + " st there"
-        : "open strings only";
-    items.push({ kind: "text", x: 2, y: 31, text: sub, size: 10, color: FB_COLOR.faint, align: "left" });
-
-    // semitone lines, with landmarks labelled
+    // semitone lines, with landmarks labelled — skipping a label that would crowd the one
+    // above it, as happens when the panel is short
+    var lastLabelY = -99;
     for (var s = 1; s <= span; s++) {
         var mark = !!FB_MARKS[s];
         items.push({ kind: "line", x1: xLow - 8, y1: yAt(s), x2: xHigh + 8, y2: yAt(s),
                      color: mark ? FB_COLOR.mark : FB_COLOR.tick, width: mark ? 1.2 : 0.8 });
-        if (mark)
+        if (mark && yAt(s) - lastLabelY >= 12) {
             items.push({ kind: "text", x: xLow - 14, y: yAt(s) + 3, text: String(s),
                          size: 9, color: FB_COLOR.faint, align: "right" });
+            lastLabelY = yAt(s);
+        }
     }
 
     // the hand's reach, as a band across the strings it stops
@@ -95,9 +103,9 @@ function layoutFingerboard(geom, w, h) {
     for (var i = 0; i < n; i++) {
         items.push({ kind: "line", x1: xAt(i), y1: top, x2: xAt(i), y2: top + bh,
                      color: FB_COLOR.string, width: 1 + 0.45 * i });
-        items.push({ kind: "text", x: xAt(i), y: top - 38, text: geom.stringNames[i],
+        items.push({ kind: "text", x: xAt(i), y: top - 31, text: geom.stringNames[i],
                      size: 11, color: FB_COLOR.text, bold: true, align: "center" });
-        items.push({ kind: "text", x: xAt(i), y: top - 25, text: FB_ROMAN[i] || "",
+        items.push({ kind: "text", x: xAt(i), y: top - 19, text: FB_ROMAN[i] || "",
                      size: 9, color: FB_COLOR.faint, align: "center" });
     }
     items.push({ kind: "line", x1: xLow - 8, y1: top, x2: xHigh + 8, y2: top,
@@ -111,9 +119,10 @@ function layoutFingerboard(geom, w, h) {
                          stroke: FB_COLOR.open, width: 2.2 });
         } else {
             var y = yAt(nt.offset);
-            items.push({ kind: "circle", x: x, y: y, r: 7, fill: FB_COLOR.stopped });
-            items.push({ kind: "text", x: x + 11, y: y + 4, text: nt.name,
-                         size: 10, color: FB_COLOR.text, bold: true, align: "left" });
+            items.push({ kind: "circle", x: x, y: y, r: dotR, fill: FB_COLOR.stopped });
+            if (showNames)
+                items.push({ kind: "text", x: x + dotR + 4, y: y + 4, text: nt.name,
+                             size: 10, color: FB_COLOR.text, bold: true, align: "left" });
         }
     }
     return items;

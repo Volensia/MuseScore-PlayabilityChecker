@@ -63,9 +63,22 @@ function seek(cur, tick) {
 // --- div./unis. ----------------------------------------------------------
 var _divCache = {};        // "scoreName|staffIdx" -> [{tick, on}]
 
-function invalidateDivCache() { _divCache = {}; }
+function invalidateDivCache() { _divCache = {}; _jeteCache = {}; _pizzCache = {}; _dynCache = {}; _tempoCache = {}; }
 
-function scanDiv(score, staffIdx) {
+function scanDiv(score, staffIdx) { return scanTextStates(score, staffIdx, S.divState); }
+
+// Staff texts that switch a state on or off, as [{tick, on}]. `classify` maps a
+// text to true, false or null (not about this state).
+// Text as a player reads it: a dynamic's SMuFL symbols become their letters
+// ("<sym>dynamicMezzo</sym><sym>dynamicForte</sym>" -> "mf"), other tags are dropped.
+var DYN_LETTER = { Piano: "p", Mezzo: "m", Forte: "f", Rinforzando: "r", Sforzando: "s", Z: "z", Niente: "n" };
+function plainText(txt) {
+    return String(txt).replace(/<sym>dynamic(\w+)<\/sym>/g, function (m, name) {
+        return DYN_LETTER[name] !== undefined ? DYN_LETTER[name] : "";
+    }).replace(/<[^>]*>/g, "");
+}
+
+function scanTextStates(score, staffIdx, classify) {
     var cur = score.newCursor();
     cur.staffIdx = staffIdx; cur.voice = 0; cur.rewind(0);
     var changes = [];
@@ -78,7 +91,7 @@ function scanDiv(score, staffIdx) {
                 if ((tr >> 2) !== staffIdx) continue;      // annotations list covers every staff
                 try { txt = el.text || "" } catch (e) {}
                 if (!txt) continue;
-                var st = S.divState(String(txt).replace(/<[^>]*>/g, ""));
+                var st = classify(plainText(txt), el);
                 if (st !== null) changes.push({ tick: cur.tick, on: st });
             }
         cur.next();
@@ -88,6 +101,10 @@ function scanDiv(score, staffIdx) {
 
 // Is there a div./unis. text inside this tick range? (cheap, ranged)
 function divTextInRange(score, staffIdx, from, to) {
+    return textStateInRange(score, staffIdx, from, to, S.divState);
+}
+
+function textStateInRange(score, staffIdx, from, to, classify) {
     var cur = score.newCursor();
     cur.staffIdx = staffIdx; cur.voice = 0;
     seek(cur, from);
@@ -99,7 +116,7 @@ function divTextInRange(score, staffIdx, from, to) {
                 try { tr = el.track } catch (e) {}
                 if ((tr >> 2) !== staffIdx) continue;
                 try { txt = el.text || "" } catch (e) {}
-                if (txt && S.divState(String(txt).replace(/<[^>]*>/g, "")) !== null) return true;
+                if (txt && classify(plainText(txt), el) !== null) return true;
             }
         cur.next();
     }
@@ -107,14 +124,100 @@ function divTextInRange(score, staffIdx, from, to) {
 }
 
 function divChanges(score, staffIdx, range) {
+    return cachedTextStates(_divCache, score, staffIdx, range, S.divState);
+}
+
+// A ranged pass reuses the cached map unless the edited bars hold such a text now
+// or held one before — the second case is a text that was just deleted.
+function cachedTextStates(cache, score, staffIdx, range, classify) {
     var key = score.scoreName + "|" + staffIdx;
-    var cached = _divCache[key];
-    var ranged = range && range.from >= 0;
-    if (cached && ranged && !divTextInRange(score, staffIdx, range.from, range.to))
-        return cached;
-    var fresh = scanDiv(score, staffIdx);
-    _divCache[key] = fresh;
+    var cached = cache[key];
+    if (cached && range && range.from >= 0) {
+        var hadOne = false;
+        for (var i = 0; i < cached.length; i++)
+            if (cached[i].tick >= range.from && cached[i].tick <= range.to) hadOne = true;
+        if (!hadOne && !textStateInRange(score, staffIdx, range.from, range.to, classify))
+            return cached;
+    }
+    var fresh = scanTextStates(score, staffIdx, classify);
+    if (cached && JSON.stringify(cached) !== JSON.stringify(fresh)) _textsChanged = true;
+    cache[key] = fresh;
     return fresh;
+}
+// Set when a ranged pass finds a div./jeté text added, moved or deleted: that text
+// changes how every later chord on the staff is judged, so the caller should redo
+// the whole score rather than just the edited bars.
+var _textsChanged = false;
+
+// jeté on/off texts, cached the same way as div.
+var _jeteCache = {};
+function jeteChanges(score, staffIdx, range) {
+    return cachedTextStates(_jeteCache, score, staffIdx, range, S.jeteState);
+}
+var _pizzCache = {}, _dynCache = {};
+function pizzChanges(score, staffIdx, range) {
+    return cachedTextStates(_pizzCache, score, staffIdx, range, S.pizzState);
+}
+// [{tick, on: settled velocity}] — see strings.js dynamicVelocity
+function dynamicChanges(score, staffIdx, range) {
+    return cachedTextStates(_dynCache, score, staffIdx, range, S.dynamicVelocity);
+}
+
+// Value of an on/off or numeric state map at a tick, or `dflt` before the first change.
+function valueAt(changes, tick, dflt) {
+    var v = dflt;
+    for (var i = 0; i < changes.length; i++) {
+        if (changes[i].tick <= tick) v = changes[i].on; else break;
+    }
+    return v;
+}
+
+// --- tempo ---------------------------------------------------------------
+// Tempo marks are Element.TEMPO_TEXT annotations whose `tempo` is quarter notes per
+// second (verified on 3.6.2: "♩ = 60" reads 1). They can sit on any staff and on a
+// segment where the first staff has no note, so every segment of the score is walked.
+// The map is cached per score; a ranged pass that finds it changed asks for a
+// whole-score redo, as a changed text does. Without a tempo mark MuseScore plays
+// ♩ = 120.
+var _tempoCache = {};
+function tempoMap(score, env, range) {
+    var key = score.scoreName, map = [], seg = null;
+    try { seg = score.firstMeasure.firstSegment } catch (e) {}
+    while (seg) {
+        var ann = null;
+        try { ann = seg.annotations } catch (e2) {}
+        if (ann)
+            for (var a = 0; a < ann.length; a++) {
+                var q = undefined;
+                if (ann[a].type !== env.TEMPO_TEXT) continue;
+                try { q = ann[a].tempo } catch (e3) {}
+                if (typeof q === "number" && q > 0 &&
+                    (!map.length || map[map.length - 1].tick !== seg.tick))
+                    map.push({ tick: seg.tick, qps: q });
+            }
+        try { seg = seg.next } catch (e4) { seg = null; }
+    }
+    var old = _tempoCache[key];
+    if (old && range && range.from >= 0 && JSON.stringify(old) !== JSON.stringify(map)) _textsChanged = true;
+    _tempoCache[key] = map;
+    return map;
+}
+
+// Seconds from tick t0 to t1 (480 ticks to a quarter note).
+function fmtSeconds(x) { return (Math.round(x * 10) / 10) + " s"; }
+
+function secondsBetween(map, t0, t1) {
+    var secs = 0, t = t0, qps = 2;
+    for (var i = 0; i < map.length; i++) if (map[i].tick <= t0) qps = map[i].qps;
+    for (var j = 0; j < map.length && t < t1; j++) {
+        if (map[j].tick <= t) continue;
+        var edge = Math.min(map[j].tick, t1);
+        secs += (edge - t) / 480 / qps;
+        t = edge;
+        qps = map[j].qps;
+    }
+    if (t < t1) secs += (t1 - t) / 480 / qps;
+    return secs;
 }
 
 function divAt(changes, tick) {
@@ -279,16 +382,71 @@ function buildCircleMap(elements, env) {
     return map;
 }
 
+// --- slurs and staccato dots (S10) ----------------------------------------
+// Neither a Chord nor the Score hands over its slurs or articulations, but the
+// select-all that finds harmonic circles returns both (verified on 3.6.2): a Slur
+// with spannerTick / spannerTicks (FractionWrappers, read .ticks) and track, and
+// each staccato as an Articulation whose parent is the Chord. A slur's length runs
+// from its first chord's tick to its last chord's tick, so the stroke is every
+// chord in [from, to] on that track.
+// Hairpins come from the same list (Element.HAIRPIN; hairpinType 0/2 = crescendo,
+// 1/3 = diminuendo), with their veloChange (0 unless the user set one).
+// Returns { slurs: { track: [{from, to}] }, dots: { "track|tick": true },
+//           hairpins: { staffIdx: [{from, to, cresc, change}] } }.
+function buildBowMap(elements, env) {
+    var map = { slurs: {}, dots: {}, hairpins: {} };
+    if (!elements) return map;
+    for (var i = 0; i < elements.length; i++) {
+        var el = elements[i];
+        if (el.type === env.SLUR) {
+            var from = -1, len = -1, tr = -1;
+            try { from = el.spannerTick.ticks } catch (e) {}
+            try { len = el.spannerTicks.ticks } catch (e2) {}
+            try { tr = el.track } catch (e3) {}
+            if (from < 0 || len < 0 || tr < 0) continue;
+            if (!map.slurs[tr]) map.slurs[tr] = [];
+            map.slurs[tr].push({ from: from, to: from + len });
+        } else if (env.HAIRPIN !== undefined && el.type === env.HAIRPIN) {
+            var hf = -1, hl = -1, htr = -1, ht = -1, hc = 0;
+            try { hf = el.spannerTick.ticks } catch (e8) {}
+            try { hl = el.spannerTicks.ticks } catch (e9) {}
+            try { htr = el.track } catch (e10) {}
+            try { ht = el.hairpinType } catch (e11) {}
+            try { hc = Number(el.veloChange) || 0 } catch (e12) {}
+            if (hf < 0 || hl <= 0 || htr < 0 || ht < 0 || ht > 3) continue;
+            var hst = htr >> 2;
+            if (!map.hairpins[hst]) map.hairpins[hst] = [];
+            map.hairpins[hst].push({ from: hf, to: hf + hl, cresc: ht === 0 || ht === 2, change: hc });
+        } else if (el.type === env.ARTICULATION) {
+            var sym = null;
+            try { sym = el.symbol } catch (e4) {}
+            if (!S.isStaccatoSymbol(sym)) continue;
+            var chord = null, tick = -1, ctr = -1;
+            try { chord = el.parent } catch (e5) {}
+            if (!chord) continue;
+            try { tick = chord.parent.tick } catch (e6) {}
+            try { ctr = chord.track } catch (e7) {}
+            if (tick >= 0 && ctr >= 0) map.dots[ctr + "|" + tick] = true;
+        }
+    }
+    for (var t in map.slurs) map.slurs[t].sort(function (a, b) { return a.from - b.from; });
+    return map;
+}
+
 // --- analysis ------------------------------------------------------------
 // env  : { CHORD: Element.CHORD, DIAMOND: NoteHeadGroup.HEAD_DIAMOND }
 // range: optional { from, to } in ticks — live mode passes the layout range of
 //        the edit so only the affected bars are re-examined.
 // Returns { rows, marks, counts }. Nothing is written to the score here.
-function analyse(score, env, range, circles, ranges) {
+function analyse(score, env, range, circles, ranges, bowing) {
     var starts = barMap(score), staves = staffInstruments(score);
     var rows = [], marks = [], covers = [];
     var counts = { open: 0, playable: 0, outOfReach: 0, impossible: 0, div: 0,
-                   harmonics: 0, harmRisky: 0, harmBad: 0, covered: 0 };
+                   harmonics: 0, harmRisky: 0, harmBad: 0, covered: 0,
+                   jete: 0, jeteFlagged: 0, groups: 0, groupsFlagged: 0,
+                   slurs: 0, slursFlagged: 0 };
+    var marked = {};            // "track|tick|grace|pitch" -> colour given this pass
+    _textsChanged = false;
     var from = range && range.from >= 0 ? range.from : -1;
     var to   = range && range.to   >= 0 ? range.to   : -1;
 
@@ -301,6 +459,19 @@ function analyse(score, env, range, circles, ranges) {
         if (!anyString) continue;               // never a bowed string staff
         var changes = divChanges(score, st, range);
 
+        // A note MuseScore paints in its own range colour never shows ours
+        // (note.cpp:1265-1271). Flag it so applyMarks can draw a notehead over it.
+        var markNote = function (noteEl, pitch, color, rng, trk, tick, graceIdx) {
+            var ms = museScoreRangeColor(rng, pitch);
+            var cover = !!(ms && ms !== color);
+            marks.push({ note: noteEl, color: color, cover: cover });
+            marked[trk + "|" + tick + "|" + graceIdx + "|" + pitch] = color;
+            if (cover) {
+                counts.covered++;
+                covers.push({ track: trk, tick: tick, grace: graceIdx, pitch: pitch, color: color });
+            }
+        };
+
         // one chord (ordinary or grace): mark it and, if it is a stop, judge it
         // graceIdx: -1 for the main chord, else its index in graceNotes. Rows carry
         // { track, tick, grace } so the panel can turn a row back into notes.
@@ -309,17 +480,9 @@ function analyse(score, env, range, circles, ranges) {
             if (!instr) return;                 // staff is a non-string instrument here
             var trk = -1;
             try { trk = chordEl.track } catch (e0) {}
-            // A note MuseScore paints in its own range colour never shows ours
-            // (note.cpp:1265-1271). Flag it so applyMarks can draw a notehead over it.
             var rng = ranges ? rangeAt(ranges, instrList, st, tick) : null;
             var mark = function (noteEl, pitch, color) {
-                var ms = museScoreRangeColor(rng, pitch);
-                var cover = !!(ms && ms !== color);
-                marks.push({ note: noteEl, color: color, cover: cover });
-                if (cover) {
-                    counts.covered++;
-                    covers.push({ track: trk, tick: tick, grace: graceIdx, pitch: pitch, color: color });
-                }
+                markNote(noteEl, pitch, color, rng, trk, tick, graceIdx);
             };
             // a circle from the Articulations palette belongs to the whole chord
             var chordCircle = false;
@@ -410,8 +573,195 @@ function analyse(score, env, range, circles, ranges) {
                 cur.next();
             }
         }
+
+        if (bowing) checkJete(st, info, instrList, markNote);
     }
-    return { rows: rows, marks: marks, counts: counts, covers: covers };
+    return { rows: rows, marks: marks, counts: counts, covers: covers,
+             textsChanged: from >= 0 && _textsChanged };
+
+    // Every slur on a bowed string is one bow stroke. Chords are counted (a double stop
+    // is one note, grace notes are not counted). Under pizz. there is no bow, so slurs
+    // are ignored.
+    //   S10 — a slur with a staccato dot: inside a jeté passage it is judged as jeté
+    //         (Adler p. 27), otherwise as group staccato at the dynamic in force
+    //         (Wagner p. 35).
+    //   S11 — any other slur (legato, louré): its length in seconds, from its first
+    //         chord to the end of its last (through any tie), against the bow limit
+    //         for its loudest dynamic (strings.js BOW_SECONDS).
+    // A live pass re-marks a whole stroke that overlaps the edited bars, but adds a
+    // row only for strokes that START there — rows outside the range are kept by the
+    // panel. A note already red, from this pass or an earlier one, stays red.
+    function checkJete(st, info, instrList, markNote) {
+        var on = jeteChanges(score, st, range);
+        var pizz = pizzChanges(score, st, range), dyn = dynamicChanges(score, st, range);
+        var tempo = null;
+        for (var v = 0; v < 4; v++) {
+            var trk = st * 4 + v, slurs = bowing.slurs[trk];
+            if (!slurs) continue;
+            for (var i = 0; i < slurs.length; i++) {
+                var sl = slurs[i];
+                if (from >= 0 && (sl.to < from || sl.from > to)) continue;
+                if (divAt(pizz, sl.from)) continue;         // divAt reads any on/off map
+                var instr = instrAt(instrList, sl.from);
+                if (!S.jeteLimit(instr)) continue;          // not a bowed string here
+                var chords = [], dotted = false, cur = score.newCursor();
+                cur.staffIdx = st; cur.voice = v;
+                seek(cur, sl.from);
+                while (cur.segment && cur.tick <= sl.to) {
+                    var el = cur.element;
+                    if (el && el.type === env.CHORD && cur.tick >= sl.from) {
+                        chords.push({ chord: el, tick: cur.tick });
+                        if (bowing.dots[trk + "|" + cur.tick]) dotted = true;
+                    }
+                    cur.next();
+                }
+                if (chords.length < 2) continue;
+                var verdict, reason;
+                if (dotted) {
+                    var jete = divAt(on, sl.from), limit, label;
+                    if (jete) {
+                        limit = S.jeteLimit(instr);
+                        label = "jeté: ";
+                    } else {
+                        var loud = S.isLoud(valueAt(dyn, sl.from, 0));
+                        limit = { max: loud ? S.GROUP_STACCATO_LIMIT.loud : S.GROUP_STACCATO_LIMIT.soft,
+                                  verdict: S.GROUP_STACCATO_LIMIT.verdict };
+                        label = "slurred staccato" + (loud ? " at f" : "") + ": ";
+                    }
+                    counts[jete ? "jete" : "groups"]++;
+                    if (chords.length <= limit.max) continue;
+                    counts[jete ? "jeteFlagged" : "groupsFlagged"]++;
+                    verdict = limit.verdict;
+                    reason = label + chords.length + " notes on one bow (max " + limit.max + ")";
+                } else {
+                    if (!tempo) tempo = tempoMap(score, env, range);
+                    var endTick = strokeEnd(chords[chords.length - 1]);
+                    var cuts = [];
+                    for (var q = 0; q < chords.length; q++) cuts.push(chords[q].tick);
+                    var use = bowUse(instr, dyn, bowing.hairpins[st] || [], tempo, sl.from, endTick, cuts);
+                    if (!use) continue;
+                    counts.slurs++;
+                    if (use.warn <= 1 + 1e-9) continue;
+                    counts.slursFlagged++;
+                    var red = use.red > 1 + 1e-9;
+                    verdict = red ? "impossible" : "outOfReach";
+                    if (use.tiers.length === 1) {
+                        var bl = S.bowLimit(instr, use.tiers[0]);
+                        reason = "slur " + fmtSeconds(use.secs) + " at " + use.tiers[0] + " (" +
+                                 (red ? "longest one bow can last " + fmtSeconds(bl.red)
+                                      : "max " + fmtSeconds(bl.warn)) + ")";
+                    } else {
+                        reason = "slur " + fmtSeconds(use.secs) + ", " + use.tiers[0] + "–" +
+                                 use.tiers[use.tiers.length - 1] + " (needs " +
+                                 Math.round((red ? use.red : use.warn) * 100) + "% of " +
+                                 (red ? "the longest bow" : "a comfortable bow") + ")";
+                    }
+                }
+                var color = S.COLOR[verdict], names = [];
+                var rng = ranges ? rangeAt(ranges, instrList, st, sl.from) : null;
+                for (var c = 0; c < chords.length; c++) {
+                    var ns = chords[c].chord.notes, top = -1;
+                    for (var n = 0; n < ns.length; n++) {
+                        var p = ns[n].pitch;
+                        if (p > top) top = p;
+                        var prev = marked[trk + "|" + chords[c].tick + "|-1|" + p];
+                        if (prev === S.COLOR.impossible) continue;
+                        if (prev === undefined && String(ns[n].color).toLowerCase() === S.COLOR.impossible &&
+                            from >= 0 && (chords[c].tick < from || chords[c].tick > to)) continue;
+                        markNote(ns[n], p, color, rng, trk, chords[c].tick, -1);
+                    }
+                    names.push(S.noteName(top));
+                }
+                var noteText = dotted ? names.join(" ")
+                             : names[0] + " … " + names[names.length - 1] + " (" + names.length + " notes)";
+                if (from < 0 || sl.from >= from)
+                    rows.push({ bar: barOf(starts, sl.from), tick: sl.from, staff: info.name,
+                                verdict: verdict, reason: reason,
+                                notes: noteText, track: trk, grace: -1 });
+            }
+        }
+    }
+
+    // End tick of a stroke: the end of its last chord, or of the last note tied on
+    // from it — a tie continues the same bow.
+    function strokeEnd(last) {
+        var end = last.tick, ns = last.chord.notes;
+        try { end = last.tick + last.chord.actualDuration.ticks } catch (e) {}
+        for (var k = 0; k < ns.length; k++) {
+            try {
+                var lt = ns[k].lastTiedNote;
+                if (lt && lt.parent) {
+                    var e2 = lt.parent.parent.tick + lt.parent.actualDuration.ticks;
+                    if (e2 > end) end = e2;
+                }
+            } catch (e3) {}
+        }
+        return end;
+    }
+
+    // How much bow a stroke uses. The bow is used up at a rate set by the dynamic:
+    // a stretch of t seconds at a tier with limit L uses t / L of a bow (Sevsay p. 10
+    // works his own example this way — three quarters at ♩ = 60 take half the bow in
+    // p and the whole bow in mf). Summed over the stroke, once against the warn limits
+    // and once against the red limits; above 1 = more than one bow.
+    //
+    // The level at a moment is the dynamic in force, except inside a hairpin, where it
+    // moves in a straight line from the level at the hairpin's start to its target:
+    // the first dynamic at or after its end if that lies the right way, else the start
+    // level plus the hairpin's own veloChange (0 by default). A dynamic written inside
+    // the hairpin takes over from there. Stretches are cut at every chord, dynamic and
+    // hairpin end, and a stretch inside a hairpin is sampled in 8 equal parts.
+    // Returns { secs, warn, red, tiers: [tiers used, soft to loud] } or null.
+    function bowUse(instr, dyn, hairpins, tempo, t0, t1, cuts) {
+        if (!S.bowLimit(instr, "mf")) return null;
+        var pts = [t0, t1];
+        function addCut(t) { if (t > t0 && t < t1) pts.push(t); }
+        for (var a = 0; a < cuts.length; a++) addCut(cuts[a]);
+        for (var b = 0; b < dyn.length; b++) addCut(dyn[b].tick);
+        for (var c = 0; c < hairpins.length; c++) { addCut(hairpins[c].from); addCut(hairpins[c].to); }
+        pts.sort(function (x, y) { return x - y; });
+        var res = { secs: 0, warn: 0, red: 0, tiers: [] }, seen = {};
+        for (var k = 0; k + 1 < pts.length; k++) {
+            var a0 = pts[k], a1 = pts[k + 1];
+            if (a1 <= a0) continue;
+            var inHairpin = false;
+            for (var h = 0; h < hairpins.length; h++)
+                if (hairpins[h].from < a1 && hairpins[h].to > a0) inHairpin = true;
+            var parts = inHairpin ? 8 : 1;
+            for (var m = 0; m < parts; m++) {
+                var s0 = a0 + (a1 - a0) * m / parts, s1 = a0 + (a1 - a0) * (m + 1) / parts;
+                var tier = S.dynamicTier(levelAt(dyn, hairpins, (s0 + s1) / 2));
+                var bl = S.bowLimit(instr, tier), secs = secondsBetween(tempo, s0, s1);
+                res.secs += secs;
+                res.warn += secs / bl.warn;
+                res.red += secs / bl.red;
+                seen[tier] = true;
+            }
+        }
+        for (var t in S.TIER_ORDER) if (seen[t]) res.tiers.push(t);
+        res.tiers.sort(function (x, y) { return S.TIER_ORDER[x] - S.TIER_ORDER[y]; });
+        return res;
+    }
+
+    function levelAt(dyn, hairpins, t) {
+        var base = valueAt(dyn, t, S.DEFAULT_VELOCITY);
+        for (var h = 0; h < hairpins.length; h++) {
+            var hp = hairpins[h];
+            if (!(hp.from <= t && t < hp.to)) continue;
+            var fresh = false;                              // a dynamic inside the hairpin wins
+            for (var d = 0; d < dyn.length; d++) if (dyn[d].tick > hp.from && dyn[d].tick <= t) fresh = true;
+            if (fresh) continue;
+            var v0 = valueAt(dyn, hp.from, S.DEFAULT_VELOCITY), v1 = v0 + hp.change;
+            for (var e = 0; e < dyn.length; e++)
+                if (dyn[e].tick >= hp.to) {
+                    if (hp.cresc ? dyn[e].on > v0 : dyn[e].on < v0) v1 = dyn[e].on;
+                    break;
+                }
+            return v0 + (v1 - v0) * (t - hp.from) / (hp.to - hp.from);
+        }
+        return base;
+    }
+
 }
 
 // --- selection sync ------------------------------------------------------

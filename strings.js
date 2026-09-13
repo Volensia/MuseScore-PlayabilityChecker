@@ -234,3 +234,131 @@ function divState(text) {
     if (DIV_ON.test(text))  return true;
     return null;
 }
+
+// --- S10 jeté --------------------------------------------------------------
+// A jeté (ricochet) stroke throws the bow so it bounces through a group of notes.
+// Notation (Forsyth p. 342): a slur over the group with a dot over each note — so
+// a dotted slur is one stroke. Without a word asking for jeté a dotted slur is just
+// as likely portato or slurred staccato, so only a jeté text turns the check on, and
+// Adler's cancel words (p. 33: ord., naturale, normale, in modo ordinario) or a
+// change to another stroke turn it off.
+//
+// Limits, Adler p. 27: in the orchestra "no more than three bouncing notes at a time"
+// — a suggestion, since solo players manage more — so more than 3 on violin and
+// viola is a warning. Cello and bass bows are shorter: "three, or at most four ...
+// are the limit of what can be played", so more than 4 there is flagged as
+// unplayable. A 4-note stroke on cello or bass is within Adler's limit.
+//
+// Saltato / saltando is the Italian for sautillé (Forsyth p. 341 footnote), one note
+// per bow, so it does not switch jeté on.
+var JETE_ON  = /(^|[^a-z])(jet[ée]|gettato|ricochet)(?![a-z])/i;
+var JETE_OFF = /(^|[^a-z])(ord(\.|in)|nat(\.|ural)|norm(\.|al)|modo\s+ordinario|d[ée]tach|legato|spicc|sautill|martel|pizz|col\s+legno|arco)/i;
+function jeteState(text) {
+    if (JETE_ON.test(text))  return true;
+    if (JETE_OFF.test(text)) return false;
+    return null;
+}
+
+// Bowing stops altogether under pizz. until arco, so no slur is a bow stroke there.
+function pizzState(text) {
+    if (/(^|[^a-z])pizz/i.test(text)) return true;
+    if (/(^|[^a-z])arco(?![a-z])/i.test(text)) return false;
+    return null;
+}
+
+// Dynamic level, as the MIDI-style velocity MuseScore stores on each Dynamic
+// (verified on 3.6.2): pppp 10, ppp 16, pp 33, p 49, mp 64, mf 80, f 96, ff 112,
+// fff 126. A dynamic that changes after its attack also carries veloChange, and the
+// level it settles at is velocity + veloChange: fp 96-47 = 49, pf 49+47 = 96,
+// sfp 112-47 = 65, sfpp 112-79 = 33. Reading the numbers rather than the letters
+// means a dynamic with a custom velocity is judged by what it plays.
+//
+// Accents — sf, sfz, sff(z), fz, rf, rfz and the lone letters — are one-note stresses,
+// not a new level, so they return null and the level in force carries on. (MuseScore's
+// own playback keeps sf/sfz at 94 until the next dynamic; that is not how players read
+// them.) Anything that ends in p (sfp, sfpp) is a level.
+//
+// `el` is the element when there is one; staff text such as a typed "f" has no
+// velocity and falls back to the letters. Returns a velocity, or null.
+var DYN_VELOCITY = { pppppp: 1, ppppp: 5, pppp: 10, ppp: 16, pp: 33, p: 49, mp: 64, mf: 80,
+                     f: 96, ff: 112, fff: 126, ffff: 127, fffff: 127, ffffff: 127,
+                     fp: 49, pf: 96, sfp: 65, sfpp: 33 };
+function dynamicVelocity(text, el) {
+    var t = String(text).replace(/\s+/g, "").toLowerCase();
+    var letters = /^[pmfrszn]+$/.test(t);
+    if (letters && !/p$/.test(t) && (/^(s|r)/.test(t) || t === "fz" || /^[mrsz]$/.test(t))) return null;
+    var v, dv;
+    try { v = el ? el.velocity : undefined; dv = el ? el.veloChange : undefined; } catch (e) {}
+    if (typeof v === "number" && v > 0) return v + (typeof dv === "number" ? dv : 0);
+    if (letters && DYN_VELOCITY[t] !== undefined) return DYN_VELOCITY[t];
+    return null;
+}
+
+// true = f or louder (settled velocity 89 and up, between mf 80 and f 96), false =
+// softer; mf counts as soft (Wagner p. 35 contrasts "the softer dynamics" with
+// "forte-fortissimo").
+var LOUD_VELOCITY = 89;
+function isLoud(velocity) { return velocity >= LOUD_VELOCITY; }
+function dynamicLevel(text, el) {
+    var v = dynamicVelocity(text, el);
+    return v === null ? null : isLoud(v);
+}
+
+// S11 tiers, split halfway between MuseScore's default velocities. mp goes with p
+// (Forsyth p. 390 and 446 pair p with mp); ppp and softer with pp, fff with ff.
+function dynamicTier(velocity) {
+    if (velocity <= 40) return "pp";
+    if (velocity <= 72) return "p";
+    if (velocity <= 88) return "mf";
+    if (velocity <= 104) return "f";
+    return "ff";
+}
+var TIER_ORDER = { pp: 0, p: 1, mf: 2, f: 3, ff: 4 };
+
+// --- S11 bow capacity -----------------------------------------------------
+// Longest slur, in seconds, on one bow. Violin figures: Sevsay p. 10 gives the scale
+// 12 / 6 / 3 / 1 / 0.5 s for pp / p / mf / f / ff; the warn and red values are ours,
+// set inside the range the other sources give (sourcebook T7, S11):
+//   pp  12 / 15  Widor p. 163, Forsyth p. 343 ≈ 10–13 s; Askenfelt 1986 p. 1011 and
+//                Flesch p. 64: about 15 s is the slowest steady bow
+//   p    6 / 12  Wagner p. 30: 6.7–8.9 s up to andante
+//   mf   3 /  6  Russo: one bar at mp
+//   f  2.5 / 4.5 Forsyth p. 390: 2–3 crotchets of moderato; Schoonderwaldt 2009 p. 2715:
+//                a 4 s note at f only reaches mf loudness; Wagner p. 30: 3.3–4.4 s
+//   ff 1.5 /  3  Sevsay 0.5 s; Russo two beats
+// Viola as violin. Cello and bass × 0.6 — derived: Forsyth p. 445 has the bass bow
+// changed every 3–4 s at p against Sevsay's 6 s for violin at p. No source gives a
+// cello figure. Without any dynamic the passage is taken as mf.
+var BOW_SECONDS = { pp: { warn: 12,  red: 15 }, p:  { warn: 6,   red: 12 },
+                    mf: { warn: 3,   red: 6 },  f:  { warn: 2.5, red: 4.5 },
+                    ff: { warn: 1.5, red: 3 } };
+var BOW_FACTOR = { "Violin": 1, "Viola": 1, "Cello": 0.6, "Double bass": 0.6 };
+var DEFAULT_VELOCITY = 80;
+function bowLimit(instr, tier) {
+    if (!instr || BOW_FACTOR[instr.name] === undefined || !BOW_SECONDS[tier]) return null;
+    var f = BOW_FACTOR[instr.name];
+    return { warn: BOW_SECONDS[tier].warn * f, red: BOW_SECONDS[tier].red * f };
+}
+
+// Group staccato — dots under a slur with no jeté asked for. Wagner p. 35: "four to
+// six notes in one bow is a safe maximum for the softer dynamics in moderate tempos.
+// Three notes in one bow should not be exceeded in the forte-fortissimo levels."
+// Same for every bowed string (he gives no per-instrument figures). Before any
+// dynamic the soft limit applies. Tempo is not read.
+var GROUP_STACCATO_LIMIT = { soft: 6, loud: 3, verdict: "outOfReach" };
+
+var JETE_LIMIT = {
+    "Violin":      { max: 3, verdict: "outOfReach" },
+    "Viola":       { max: 3, verdict: "outOfReach" },
+    "Cello":       { max: 4, verdict: "impossible" },
+    "Double bass": { max: 4, verdict: "impossible" }
+};
+function jeteLimit(instr) { return instr ? JETE_LIMIT[instr.name] || null : null; }
+
+// Staccato-type articulations that make a slur a bounced stroke. Portato (tenuto +
+// staccato) is an on-the-string stroke and does not count.
+function isStaccatoSymbol(sym) {
+    if (sym === undefined || sym === null) return false;
+    var s = String(sym);
+    return /^artic(Staccato|Staccatissimo|AccentStaccato|MarcatoStaccato)/.test(s);
+}

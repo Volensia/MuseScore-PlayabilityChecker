@@ -22,17 +22,19 @@ MuseScore {
 
     property var env: ({ CHORD: Element.CHORD, DIAMOND: NoteHeadGroup.HEAD_DIAMOND,
                          INSTRUMENT_CHANGE: Element.INSTRUMENT_CHANGE,
-                         ARTICULATION: Element.ARTICULATION })
+                         ARTICULATION: Element.ARTICULATION, SLUR: Element.SLUR, HAIRPIN: Element.HAIRPIN, TEMPO_TEXT: Element.TEMPO_TEXT })
 
-    // Harmonic circles from the Articulations palette are only reachable through
-    // the selection, so this borrows the selection and puts it back.
-    function circleMap() {
-        if (!curScore) return null;
+    // Harmonic circles from the Articulations palette, slurs and staccato dots (S10)
+    // are only reachable through the selection, so this borrows the selection once
+    // and puts it back. Returns { circles, bowing }.
+    function selectionMaps() {
+        if (!curScore) return { circles: null, bowing: null };
         var keep = A.saveSelection(curScore);
         cmd("select-all");
-        var map = A.buildCircleMap(curScore.selection.elements, env);
+        var els = curScore.selection.elements;
+        var maps = { circles: A.buildCircleMap(els, env), bowing: A.buildBowMap(els, env) };
         A.restoreSelection(curScore, keep);
-        return map;
+        return maps;
     }
     property string statusLine: ""
 
@@ -52,7 +54,8 @@ MuseScore {
     }
 
     function runCheck() {
-        var out = A.analyse(curScore, env, null, circleMap());
+        var maps = selectionMaps();
+        var out = A.analyse(curScore, env, null, maps.circles, null, maps.bowing);
         var applied = A.applyMarks(curScore, out.marks);
         results.clear();
         for (var i = 0; i < out.rows.length; i++) results.append(out.rows[i]);
@@ -62,6 +65,9 @@ MuseScore {
                      (c.div ? " · " + c.div + " skipped (div.)" : "") +
                      (c.harmonics ? " · " + c.harmonics + " harmonics (" +
                                     (c.harmBad + c.harmRisky) + " flagged)" : "") +
+                     (c.jete ? " · " + c.jete + " jeté strokes (" + c.jeteFlagged + " flagged)" : "") +
+                     (c.groups ? " · " + c.groups + " staccato groups (" + c.groupsFlagged + " flagged)" : "") +
+                     (c.slurs ? " · " + c.slurs + " slurs timed (" + c.slursFlagged + " too long)" : "") +
                      (applied.skipped ? " · " + applied.skipped + " left alone (own colour)" : "");
         console.log("PlayabilityChecker: " + statusLine + " — " + out.rows.length + " flagged");
     }

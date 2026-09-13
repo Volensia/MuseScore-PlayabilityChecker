@@ -31,7 +31,7 @@ MuseScore {
                          DIAMOND: NoteHeadGroup.HEAD_DIAMOND,
                          NORMAL: NoteHeadGroup.HEAD_NORMAL,
                          INSTRUMENT_CHANGE: Element.INSTRUMENT_CHANGE,
-                         ARTICULATION: Element.ARTICULATION,
+                         ARTICULATION: Element.ARTICULATION, SLUR: Element.SLUR, HAIRPIN: Element.HAIRPIN, TEMPO_TEXT: Element.TEMPO_TEXT,
                          SYM: { black: SymId.noteheadBlack, half: SymId.noteheadHalf,
                                 whole: SymId.noteheadWhole, breve: SymId.noteheadDoubleWhole,
                                 diamondBlack: SymId.noteheadDiamondBlack,
@@ -62,6 +62,7 @@ MuseScore {
                  newSymbol: function () { return newElement(Element.SYMBOL); } };
     }
     property var circles: null          // "track|tick" -> true, rebuilt on full checks
+    property var bowing: null           // slurs and staccato dots for S10, rebuilt with circles
     property bool liveOn: true
     property bool busy: false           // re-entry guard: our own writes fire onScoreStateChanged
     property bool syncing: false        // the panel itself is moving a selection
@@ -70,14 +71,6 @@ MuseScore {
     property string selectedInfo: ""    // the "Selected" line under the table
     property var geom: null             // fingerboard data while a playable chord is selected
     property bool showList: false       // the user asked for the list back
-
-    // TEMPORARY: says where the fingerboard fails, if it does. Remove once it is seen working.
-    property string debugInfo: selectedInfo === "" ? "" :
-        ("fingerboard " + (geom !== null ? "recognised" : "not recognised") +
-         " · " + (board.items ? board.items.length : 0) + " shapes" +
-         " · area " + Math.round(listArea.width) + "×" + Math.round(listArea.height) +
-         " · diagram " + Math.round(board.width) + "×" + Math.round(board.height) +
-         " · shown " + board.visible + (showList ? " (list chosen)" : ""))
 
     property int passes: 0
     property string statusLine: "not run yet"
@@ -91,11 +84,15 @@ MuseScore {
     // automatically made editing unusable: every typed note lost its selection.
     // It now runs ONLY on an explicit action — plugin start, Re-check, Apply.
     // Circles from the Symbols palette need none of this and stay fully live.
+    // Slurs and staccato dots (S10 jeté) come from the same select-all, so a slur
+    // added or removed while typing is only seen after Re-check.
     function rebuildCircles() {
         if (!curScore) return;
         var keep = A.saveSelection(curScore);
         cmd("select-all");
-        circles = A.buildCircleMap(curScore.selection.elements, env);
+        var els = curScore.selection.elements;
+        circles = A.buildCircleMap(els, env);
+        bowing = A.buildBowMap(els, env);
         A.restoreSelection(curScore, keep);
     }
 
@@ -108,7 +105,12 @@ MuseScore {
         busy = true;
         A.clearMarks(curScore, env, { command: command, from: range ? range.from : -1,
                                                         to:   range ? range.to   : -1 });
-        var out = A.analyse(curScore, env, range, circles, coverOn ? ranges : null);
+        var out = A.analyse(curScore, env, range, circles, coverOn ? ranges : null, bowing);
+        if (out.textsChanged) {             // a div./jeté text moved: later bars change too
+            busy = false;
+            check(null, command, false);
+            return;
+        }
         var applied = A.applyMarks(curScore, out.marks, overlayOpts(command));
         busy = false;
         passes++;
@@ -148,6 +150,9 @@ MuseScore {
                      (c.div ? " · " + c.div + " skipped (div.)" : "") +
                      (c.harmonics ? " · " + c.harmonics + " harmonics (" +
                                     (c.harmBad + c.harmRisky) + " flagged)" : "") +
+                     (c.jete ? " · " + c.jete + " jeté strokes (" + c.jeteFlagged + " flagged)" : "") +
+                     (c.groups ? " · " + c.groups + " staccato groups (" + c.groupsFlagged + " flagged)" : "") +
+                     (c.slurs ? " · " + c.slurs + " slurs timed (" + c.slursFlagged + " too long)" : "") +
                      (applied.skipped ? " · " + applied.skipped + " own colour kept" : "") +
                      (c.covered ? " · " + c.covered + " drawn over MuseScore's range colour" : "");
         console.log("PlayabilityChecker live: pass " + passes +
@@ -232,6 +237,7 @@ MuseScore {
         if (curScore.scoreName !== lastScore) {     // switched tab: start over
             lastScore = curScore.scoreName;
             circles = null;             // the old score's map does not apply here
+            bowing = null;
             ranges = null;
             covers = [];
             debounce.range = null;
@@ -320,7 +326,7 @@ MuseScore {
             id: listArea
             Layout.fillWidth: true
             Layout.fillHeight: true
-            Layout.minimumHeight: 220
+            // no minimum height: the buttons below must stay reachable in a short panel
 
         // While a playable chord is selected, its fingerboard replaces the list.
         // Drawn with plain Rectangles and Text, NOT a Canvas: a QML Canvas paints
@@ -334,6 +340,12 @@ MuseScore {
             clip: true
             property var items: (geom !== null && width > 0 && height > 0)
                                 ? F.layoutFingerboard(geom, width, height) : []
+            // true when the diagram labels its dots itself (see fingerboard.js "meta")
+            property bool namesShown: {
+                for (var i = 0; i < items.length; i++)
+                    if (items[i].kind === "meta") return items[i].namesShown;
+                return false;
+            }
             Repeater {
                 model: board.items
                 delegate: Item {
@@ -342,7 +354,7 @@ MuseScore {
                     property bool vertical: isLine && it.x1 === it.x2
                     property real lw: it.width || 1
                     Rectangle {
-                        visible: it.kind !== "text"
+                        visible: it.kind === "line" || it.kind === "rect" || it.kind === "circle"
                         x: isLine ? (vertical ? it.x1 - lw / 2 : Math.min(it.x1, it.x2))
                                   : (it.kind === "circle" ? it.x - it.r : it.x)
                         y: isLine ? (vertical ? Math.min(it.y1, it.y2) : it.y1 - lw / 2)
@@ -391,16 +403,9 @@ MuseScore {
 
         Text {
             Layout.fillWidth: true
-            visible: debugInfo !== ""
-            text: "debug — " + debugInfo
-            wrapMode: Text.WordWrap
-            font.pixelSize: 10
-            color: "#8a8a8a"
-        }
-
-        Text {
-            Layout.fillWidth: true
-            visible: selectedInfo !== ""
+            // redundant under a fingerboard that names its notes; kept with the list, and
+            // in a panel too narrow for the diagram's note names
+            visible: selectedInfo !== "" && (geom === null || showList || !board.namesShown || !board.visible)
             text: "Selected: " + selectedInfo
             wrapMode: Text.WordWrap
             font.pixelSize: 11
@@ -412,7 +417,7 @@ MuseScore {
             spacing: 6
             Button {
                 text: "Re-check"
-                tooltip: "Also scans for harmonic circles added from the Articulations palette"
+                tooltip: "Also rescans harmonic circles from the Articulations palette, and slurs for jeté"
                 onClicked: fullCheck(false)
             }
             Button {
