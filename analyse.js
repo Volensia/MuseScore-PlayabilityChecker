@@ -99,6 +99,30 @@ function scanTextStates(score, staffIdx, classify) {
     return changes;
 }
 
+// The same, for the ticks from..to only.
+function scanTextStatesIn(score, staffIdx, classify, from, to) {
+    var cur = score.newCursor(), changes = [];
+    cur.staffIdx = staffIdx; cur.voice = 0;
+    seek(cur, from);
+    while (cur.segment && cur.tick <= to) {
+        if (cur.tick >= from) {
+            var ann = cur.segment.annotations;
+            if (ann)
+                for (var a = 0; a < ann.length; a++) {
+                    var el = ann[a], tr = -1, txt = "";
+                    try { tr = el.track } catch (e) {}
+                    if ((tr >> 2) !== staffIdx) continue;
+                    try { txt = el.text || "" } catch (e2) {}
+                    if (!txt) continue;
+                    var st = classify(plainText(txt), el);
+                    if (st !== null) changes.push({ tick: cur.tick, on: st });
+                }
+        }
+        cur.next();
+    }
+    return changes;
+}
+
 // Is there a div./unis. text inside this tick range? (cheap, ranged)
 function divTextInRange(score, staffIdx, from, to) {
     return textStateInRange(score, staffIdx, from, to, S.divState);
@@ -127,17 +151,62 @@ function divChanges(score, staffIdx, range) {
     return cachedTextStates(_divCache, score, staffIdx, range, S.divState);
 }
 
+// Whole-score passes read all four text states of a staff (div., jeté, pizz., dynamics)
+// in ONE walk: four separate walks made a whole-score check on a 16-staff, 300-bar score
+// about a second slower. The fresh lists go into the same caches the ranged passes use.
+var _freshPass = {};                // "score|staff" -> true while a whole-score pass runs
+function refreshStaffTexts(score, staffIdx) {
+    var kinds = [[_divCache, S.divState], [_jeteCache, S.jeteState], [_pizzCache, S.pizzState],
+                 [_dynCache, S.dynamicVelocity]];
+    var lists = [[], [], [], []], cur = score.newCursor();
+    cur.staffIdx = staffIdx; cur.voice = 0; cur.rewind(0);
+    while (cur.segment) {
+        var ann = cur.segment.annotations;
+        if (ann)
+            for (var a = 0; a < ann.length; a++) {
+                var el = ann[a], tr = -1, txt = "";
+                try { tr = el.track } catch (e) {}
+                if ((tr >> 2) !== staffIdx) continue;
+                try { txt = el.text || "" } catch (e2) {}
+                if (!txt) continue;
+                var plain = plainText(txt);
+                for (var k = 0; k < 4; k++) {
+                    var st = kinds[k][1](plain, el);
+                    if (st !== null) lists[k].push({ tick: cur.tick, on: st });
+                }
+            }
+        cur.next();
+    }
+    var key = score.scoreName + "|" + staffIdx;
+    for (var q = 0; q < 4; q++) {
+        var cached = kinds[q][0][key];
+        if (cached && JSON.stringify(cached) !== JSON.stringify(lists[q])) _textsChanged = true;
+        kinds[q][0][key] = lists[q];
+    }
+    _freshPass[key] = true;
+}
+
 // A ranged pass reuses the cached map unless the edited bars hold such a text now
 // or held one before — the second case is a text that was just deleted.
 function cachedTextStates(cache, score, staffIdx, range, classify) {
     var key = score.scoreName + "|" + staffIdx;
     var cached = cache[key];
+    if (cached && _freshPass[key] && !(range && range.from >= 0)) return cached;   // read this pass
     if (cached && range && range.from >= 0) {
-        var hadOne = false;
-        for (var i = 0; i < cached.length; i++)
-            if (cached[i].tick >= range.from && cached[i].tick <= range.to) hadOne = true;
-        if (!hadOne && !textStateInRange(score, staffIdx, range.from, range.to, classify))
-            return cached;
+        // Re-read only the edited bars and splice them into the cached list: a full re-read
+        // of every staff made a two-bar edit on a 300-bar, 16-staff score cost 0.7 s.
+        var before = [], inside = 0, after = [];
+        for (var i = 0; i < cached.length; i++) {
+            if (cached[i].tick < range.from) before.push(cached[i]);
+            else if (cached[i].tick > range.to) after.push(cached[i]);
+            else inside++;
+        }
+        var now = scanTextStatesIn(score, staffIdx, classify, range.from, range.to);
+        if (!inside && !now.length) return cached;
+        var merged = before.concat(now, after);
+        if (JSON.stringify(merged) !== JSON.stringify(cached)) _textsChanged = true;
+        cache[key] = merged;
+        return merged;
     }
     var fresh = scanTextStates(score, staffIdx, classify);
     if (cached && JSON.stringify(cached) !== JSON.stringify(fresh)) _textsChanged = true;
@@ -165,11 +234,19 @@ function dynamicChanges(score, staffIdx, range) {
 
 // Value of an on/off or numeric state map at a tick, or `dflt` before the first change.
 function valueAt(changes, tick, dflt) {
-    var v = dflt;
-    for (var i = 0; i < changes.length; i++) {
-        if (changes[i].tick <= tick) v = changes[i].on; else break;
+    var i = stateIndex(changes, tick);
+    return i < 0 ? dflt : changes[i].on;
+}
+
+// Index of the last change at or before `tick` in a tick-sorted list, or -1 (binary
+// search: these lookups run for every chord and every slur).
+function stateIndex(changes, tick) {
+    var lo = 0, hi = changes.length;
+    while (lo < hi) {
+        var mid = (lo + hi) >> 1;
+        if (changes[mid].tick <= tick) lo = mid + 1; else hi = mid;
     }
-    return v;
+    return lo - 1;
 }
 
 // --- tempo ---------------------------------------------------------------
@@ -204,7 +281,7 @@ function tempoMap(score, env, range) {
 }
 
 // Seconds from tick t0 to t1 (480 ticks to a quarter note).
-function fmtSeconds(x) { return (Math.round(x * 10) / 10) + " s"; }
+function fmtSeconds(x) { return (Math.round(x * 10 + 1e-6) / 10) + " s"; }   // 3.7499999 (tempo in beats/s) still shows 3.8
 
 function secondsBetween(map, t0, t1) {
     var secs = 0, t = t0, qps = 2;
@@ -221,11 +298,8 @@ function secondsBetween(map, t0, t1) {
 }
 
 function divAt(changes, tick) {
-    var on = false;
-    for (var i = 0; i < changes.length; i++) {
-        if (changes[i].tick <= tick) on = changes[i].on; else break;
-    }
-    return on;
+    var i = stateIndex(changes, tick);
+    return i < 0 ? false : changes[i].on;
 }
 
 // --- instrument changes --------------------------------------------------
@@ -260,6 +334,17 @@ function annotationTypeInRange(score, staffIdx, type, from, to) {
     return false;
 }
 
+// The sound an instrument plays when bowed: its "arco" channel, else its first channel
+// (Instrument.channels[].midiProgram, verified on 3.6.2).
+function arcoProgram(ins) {
+    var chs = null;
+    try { chs = ins.channels } catch (e) { return null; }
+    if (!chs || !chs.length) return null;
+    for (var c = 0; c < chs.length; c++)
+        if (String(chs[c].name) === "arco") return chs[c].midiProgram;
+    return chs[0].midiProgram;
+}
+
 function scanInstruments(score, env, staffIdx, part) {
     var ticks = [0], cur = score.newCursor();
     cur.staffIdx = staffIdx; cur.voice = 0; cur.rewind(0);
@@ -277,17 +362,19 @@ function scanInstruments(score, env, staffIdx, part) {
     }
     var out = [];
     for (var i = 0; i < ticks.length; i++) {
-        var id = "", ln = "";
+        var id = "", ln = "", prog = null;
         try {
             var ins = part.instrumentAtTick(ticks[i]);
             try { id = ins.instrumentId || "" } catch (e2) {}
             try { ln = ins.longName || "" } catch (e3) {}
+            prog = arcoProgram(ins);
         } catch (e) {}
         if (!id && !ln) {                       // fall back to the part's own instrument
             try { id = part.instrumentId || "" } catch (e4) {}
             try { ln = part.longName || part.partName || "" } catch (e5) {}
         }
-        out.push({ tick: ticks[i], instr: S.lookup(id, ln) });
+        if (prog === null) try { prog = part.midiProgram } catch (e6) {}
+        out.push({ tick: ticks[i], instr: S.lookup(id, ln, prog) });
     }
     return out;
 }
@@ -310,6 +397,19 @@ function instrAt(list, tick) {
         if (list[i].tick <= tick) instr = list[i].instr; else break;
     }
     return instr;
+}
+
+// --- per-track tick sets ---------------------------------------------------
+// Circles, staccato dots and marks are kept as map[track][tick]. A single flat map with
+// a "track|tick" key per note grew slower with every key in MuseScore's JavaScript
+// engine: on a 16-staff, 300-bar score, 4,800 flat keys made a scan take 1.2-1.7 s,
+// against 0.47 s with the keys split by track (see SPEC-strings.md, "Copy reader").
+function mapHas(map, track, tick) {
+    var t = map ? map[track] : undefined;
+    return !!(t && t[tick]);
+}
+function mapSet(map, track, tick, value) {
+    (map[track] || (map[track] = {}))[tick] = value === undefined ? true : value;
 }
 
 // --- harmonic circles ----------------------------------------------------
@@ -377,7 +477,7 @@ function buildCircleMap(elements, env) {
         try { seg = chord.parent } catch (e3) {}
         try { tick = seg.tick } catch (e4) {}
         try { tr = chord.track } catch (e5) {}
-        if (tick >= 0 && tr >= 0) map[tr + "|" + tick] = true;
+        if (tick >= 0 && tr >= 0) mapSet(map, tr, tick);
     }
     return map;
 }
@@ -391,10 +491,10 @@ function buildCircleMap(elements, env) {
 // chord in [from, to] on that track.
 // Hairpins come from the same list (Element.HAIRPIN; hairpinType 0/2 = crescendo,
 // 1/3 = diminuendo), with their veloChange (0 unless the user set one).
-// Returns { slurs: { track: [{from, to}] }, dots: { "track|tick": true },
+// Returns { slurs: { track: [{from, to}] }, dots: { track: { tick: true } },
 //           hairpins: { staffIdx: [{from, to, cresc, change}] } }.
 function buildBowMap(elements, env) {
-    var map = { slurs: {}, dots: {}, hairpins: {} };
+    var map = { slurs: {}, dots: {}, hairpins: {}, tremolos: {} };
     if (!elements) return map;
     for (var i = 0; i < elements.length; i++) {
         var el = elements[i];
@@ -417,6 +517,14 @@ function buildBowMap(elements, env) {
             var hst = htr >> 2;
             if (!map.hairpins[hst]) map.hairpins[hst] = [];
             map.hairpins[hst].push({ from: hf, to: hf + hl, cresc: ht === 0 || ht === 2, change: hc });
+        } else if (env.TREMOLO !== undefined && el.type === env.TREMOLO) {
+            // two-chord tremolos are listed once per chord; the first chord is the parent
+            // of the "between notes" kind
+            var tn = "", tch = null;
+            try { tn = el.subtypeName() } catch (e13) {}
+            if (!/between/.test(tn)) continue;
+            try { tch = el.parent } catch (e14) {}
+            if (tch) try { mapSet(map.tremolos, tch.track, tch.parent.tick); } catch (e15) {}
         } else if (el.type === env.ARTICULATION) {
             var sym = null;
             try { sym = el.symbol } catch (e4) {}
@@ -426,7 +534,7 @@ function buildBowMap(elements, env) {
             if (!chord) continue;
             try { tick = chord.parent.tick } catch (e6) {}
             try { ctr = chord.track } catch (e7) {}
-            if (tick >= 0 && ctr >= 0) map.dots[ctr + "|" + tick] = true;
+            if (tick >= 0 && ctr >= 0) mapSet(map.dots, ctr, tick);
         }
     }
     for (var t in map.slurs) map.slurs[t].sort(function (a, b) { return a.from - b.from; });
@@ -443,20 +551,25 @@ function analyse(score, env, range, circles, ranges, bowing) {
     var rows = [], marks = [], covers = [];
     var counts = { open: 0, playable: 0, outOfReach: 0, impossible: 0, div: 0,
                    harmonics: 0, harmRisky: 0, harmBad: 0, covered: 0,
-                   jete: 0, jeteFlagged: 0, groups: 0, groupsFlagged: 0,
-                   slurs: 0, slursFlagged: 0 };
-    var marked = {};            // "track|tick|grace|pitch" -> colour given this pass
+                   jete: 0, jeteFlagged: 0, groups: 0, groupsFlagged: 0, fast: 0, fastFlagged: 0,
+                   slurs: 0, slursFlagged: 0, tremolos: 0, tremImpossible: 0, tremAcross: 0 };
+    var marked = {};            // track -> "tick|grace|pitch" -> colour given this pass
+    var redoStaves = [];        // staves a live pass could not judge alone (a fast run crosses its edge)
     _textsChanged = false;
     var from = range && range.from >= 0 ? range.from : -1;
     var to   = range && range.to   >= 0 ? range.to   : -1;
 
+    var onlyStaves = range && range.staves ? range.staves : null;     // [staffIdx, ...] or null
+    _freshPass = {};
     for (var st = 0; st < score.nstaves; st++) {
+        if (onlyStaves && onlyStaves.indexOf(st) < 0) continue;
         var info = staves[st];
         if (!info) continue;
         var instrList = instrumentsOf(score, env, st, info.part, range);
         var anyString = false;
         for (var ai = 0; ai < instrList.length; ai++) if (instrList[ai].instr) anyString = true;
         if (!anyString) continue;               // never a bowed string staff
+        if (!(range && range.from >= 0)) refreshStaffTexts(score, st);    // whole staff: one walk for all texts
         var changes = divChanges(score, st, range);
 
         // A note MuseScore paints in its own range colour never shows ours
@@ -465,7 +578,8 @@ function analyse(score, env, range, circles, ranges, bowing) {
             var ms = museScoreRangeColor(rng, pitch);
             var cover = !!(ms && ms !== color);
             marks.push({ note: noteEl, color: color, cover: cover });
-            marked[trk + "|" + tick + "|" + graceIdx + "|" + pitch] = color;
+            var mt = marked[trk] || (marked[trk] = {});
+            mt[tick + "|" + graceIdx + "|" + pitch] = color;
             if (cover) {
                 counts.covered++;
                 covers.push({ track: trk, tick: tick, grace: graceIdx, pitch: pitch, color: color });
@@ -489,7 +603,7 @@ function analyse(score, env, range, circles, ranges, bowing) {
             if (circles) {
                 var ctr = -1;
                 try { ctr = chordEl.track } catch (e) {}
-                if (ctr >= 0 && circles[ctr + "|" + tick]) chordCircle = true;
+                if (ctr >= 0 && mapHas(circles, ctr, tick)) chordCircle = true;
             }
 
             var ns = chordEl.notes, list = [], anyD = false, anyC = chordCircle;
@@ -516,8 +630,8 @@ function analyse(score, env, range, circles, ranges, bowing) {
                         for (var hi = 0; hi < list.length; hi++)
                             mark(list[hi].note, list[hi].pitch, hc);
                         rows.push({ bar: barOf(starts, tick), tick: tick, staff: info.name,
-                                    verdict: h.verdict, reason: h.reason, notes: h.detail,
-                                    track: trk, grace: graceIdx });
+                                    kind: "harmonic", verdict: h.verdict, reason: h.reason, notes: h.detail,
+                                    track: trk, grace: graceIdx, tickEnd: tick });
                     }
                     return;
                 }
@@ -549,14 +663,15 @@ function analyse(score, env, range, circles, ranges, bowing) {
                 for (var q = 0; q < list.length; q++)
                     mark(list[q].note, list[q].pitch, col);
                 rows.push({ bar: barOf(starts, tick), tick: tick, staff: info.name,
-                            verdict: res.verdict, reason: res.reason,
+                            kind: "stop", verdict: res.verdict, reason: res.reason,
                             notes: S.describe(instr, pitches, res),
-                            track: trk, grace: graceIdx });
+                            track: trk, grace: graceIdx, tickEnd: tick });
             }
         };
 
+        var walked = [];                // voice -> { ticks, els }: chords this walk visited
         for (var v = 0; v < 4; v++) {
-            var cur = score.newCursor();
+            var cur = score.newCursor(), seen = walked[v] = { ticks: [], els: [] };
             cur.staffIdx = st; cur.voice = v;
             seek(cur, from);
             while (cur.segment) {
@@ -564,6 +679,8 @@ function analyse(score, env, range, circles, ranges, bowing) {
                 if (to >= 0 && tick > to) break;
                 var el = cur.element;
                 if (el && el.type === env.CHORD) {
+                    seen.ticks.push(tick);
+                    seen.els.push(el);
                     var grace = null;
                     try { grace = el.graceNotes } catch (e) {}
                     if (grace)
@@ -574,24 +691,121 @@ function analyse(score, env, range, circles, ranges, bowing) {
             }
         }
 
-        if (bowing) checkJete(st, info, instrList, markNote);
+        if (bowing) checkJete(st, info, instrList, markNote, walked);
+        if (bowing && bowing.tremolos) checkTremolos(st, info, instrList, markNote, walked);
+        checkFastRuns(st, info, instrList, markNote);
     }
     return { rows: rows, marks: marks, counts: counts, covers: covers,
-             textsChanged: from >= 0 && _textsChanged };
+             textsChanged: from >= 0 && _textsChanged, redoStaves: redoStaves };
+
+    // S12: fast passages in a double bass SECTION (strings.js FAST_RUN). A run is a chain
+    // of bowed notes in one voice, each shorter than 0.1 s and each starting where the
+    // last one ended (a rest, a longer note or pizz. ends it; a tied-on note counts as
+    // part of the note it continues). A run lasting longer than 1.5 s is flagged, dark
+    // yellow, one row. A live pass looks one bar either side of its range: when a run
+    // reaches over the range's edge, the rows of the whole staff are redone (redoStaves).
+    function checkFastRuns(st, info, instrList, markNote) {
+        var anyBass = false;
+        for (var i = 0; i < instrList.length; i++) {
+            var ins = instrList[i].instr;
+            if (ins && ins.section && ins.name === "Double bass") anyBass = true;
+        }
+        if (!anyBass) return;
+        var tempo = tempoMap(score, env, range), pizz = pizzChanges(score, st, range);
+        var lo = -1, hi = -1;
+        if (from >= 0) {
+            var b0 = barOf(starts, from) - 1, b1 = barOf(starts, to) - 1;
+            lo = starts[Math.max(0, b0 - 1)];
+            hi = b1 + 2 < starts.length ? starts[b1 + 2] - 1 : -1;
+        }
+        var redo = false;
+        for (var v = 0; v < 4 && !redo; v++) {
+            var trk = st * 4 + v, run = [], prevEnd = -1;
+            var close = function () {
+                var r = run;
+                run = [];
+                if (r.length < 2) return;
+                var t0 = r[0].tick, t1 = r[r.length - 1].end, last = r[r.length - 1].tick;
+                if (from >= 0) {
+                    if (last < from || t0 > to) return;             // outside the edited bars
+                    if (t0 < from || last > to) { redo = true; return; }
+                }
+                var secs = secondsBetween(tempo, t0, t1);
+                counts.fast++;
+                if (secs <= S.FAST_RUN.maxRunSeconds + 1e-9) return;
+                counts.fastFlagged++;
+                var color = S.COLOR[S.FAST_RUN.verdict], top0 = -1, topN = -1;
+                var rng = ranges ? rangeAt(ranges, instrList, st, t0) : null;
+                for (var c = 0; c < r.length; c++) {
+                    var ns = r[c].chord.notes;
+                    for (var n = 0; n < ns.length; n++) {
+                        var p = ns[n].pitch;
+                        if (c === 0 && p > top0) top0 = p;
+                        if (c === r.length - 1 && p > topN) topN = p;
+                        var prev = marked[trk] ? marked[trk][r[c].tick + "|-1|" + p] : undefined;
+                        if (prev === S.COLOR.impossible) continue;
+                        markNote(ns[n], p, color, rng, trk, r[c].tick, -1);
+                    }
+                }
+                var rate = Math.round(r.length / secs * 10) / 10;
+                rows.push({ bar: barOf(starts, t0), tick: t0, staff: info.name, kind: "fast",
+                            verdict: S.FAST_RUN.verdict,
+                            reason: "fast passage: " + rate + " notes/s for " + fmtSeconds(secs) +
+                                    " (section max 10/s for 1.5 s)",
+                            notes: S.noteName(top0) + " … " + S.noteName(topN) + " (" + r.length + " notes)",
+                            track: trk, grace: -1, tickEnd: last });
+            };
+            var cur = score.newCursor();
+            cur.staffIdx = st; cur.voice = v;
+            seek(cur, lo);
+            while (cur.segment) {
+                var tick = cur.tick;
+                if (hi >= 0 && tick > hi) break;
+                var el = cur.element;
+                if (el && el.type === env.CHORD) {
+                    var ns0 = el.notes, back = false, end = tick;
+                    try { back = !!ns0[0].tieBack } catch (e1) {}
+                    try { end = tick + el.actualDuration.ticks } catch (e2) {}
+                    if (back && tick === prevEnd) {                 // a tied-on note: lengthen the last one
+                        if (run.length) {
+                            run[run.length - 1].end = end;
+                            if (secondsBetween(tempo, run[run.length - 1].tick, end) >= S.FAST_RUN.maxNoteSeconds - 1e-9) {
+                                run.pop(); close();
+                            }
+                        }
+                        prevEnd = end;
+                    } else {
+                        var instr = instrAt(instrList, tick);
+                        var ok = instr && instr.section && instr.name === "Double bass" && !divAt(pizz, tick) &&
+                                 secondsBetween(tempo, tick, end) < S.FAST_RUN.maxNoteSeconds - 1e-9;
+                        if (!ok || tick !== prevEnd) close();
+                        if (ok) run.push({ chord: el, tick: tick, end: end });
+                        prevEnd = end;
+                    }
+                } else if (el) {                                    // a rest
+                    close();
+                    prevEnd = -1;
+                }
+                cur.next();
+            }
+            close();
+        }
+        if (redo) redoStaves.push(st);
+    }
 
     // Every slur on a bowed string is one bow stroke. Chords are counted (a double stop
     // is one note, grace notes are not counted). Under pizz. there is no bow, so slurs
     // are ignored.
     //   S10 — a slur with a staccato dot: inside a jeté passage it is judged as jeté
-    //         (Adler p. 27), otherwise as group staccato at the dynamic in force
-    //         (Wagner p. 35).
-    //   S11 — any other slur (legato, louré): its length in seconds, from its first
+    //         (Adler p. 27 notation; limit Sevsay p. 18 / Wagner p. 40); without a jeté
+    //         text it is slurred staccato and is timed like any other slur (S11).
+    //   S11 — any other slur (legato, louré, slurred staccato): its length in seconds, from its first
     //         chord to the end of its last (through any tie), against the bow limit
     //         for its loudest dynamic (strings.js BOW_SECONDS).
     // A live pass re-marks a whole stroke that overlaps the edited bars, but adds a
     // row only for strokes that START there — rows outside the range are kept by the
     // panel. A note already red, from this pass or an earlier one, stays red.
-    function checkJete(st, info, instrList, markNote) {
+    function checkJete(st, info, instrList, markNote, walked) {
         var on = jeteChanges(score, st, range);
         var pizz = pizzChanges(score, st, range), dyn = dynamicChanges(score, st, range);
         var tempo = null;
@@ -604,82 +818,201 @@ function analyse(score, env, range, circles, ranges, bowing) {
                 if (divAt(pizz, sl.from)) continue;         // divAt reads any on/off map
                 var instr = instrAt(instrList, sl.from);
                 if (!S.jeteLimit(instr)) continue;          // not a bowed string here
-                var chords = [], dotted = false, cur = score.newCursor();
-                cur.staffIdx = st; cur.voice = v;
-                seek(cur, sl.from);
-                while (cur.segment && cur.tick <= sl.to) {
-                    var el = cur.element;
-                    if (el && el.type === env.CHORD && cur.tick >= sl.from) {
-                        chords.push({ chord: el, tick: cur.tick });
-                        if (bowing.dots[trk + "|" + cur.tick]) dotted = true;
+                var chords = [], dotted = false;
+                if ((from < 0 || sl.from >= from) && (to < 0 || sl.to <= to)) {
+                    // inside the span the main walk covered: take its chords (binary search)
+                    var wt = walked[v].ticks, lo = 0, hi = wt.length;
+                    while (lo < hi) { var mid = (lo + hi) >> 1; if (wt[mid] < sl.from) lo = mid + 1; else hi = mid; }
+                    for (var w = lo; w < wt.length && wt[w] <= sl.to; w++) {
+                        chords.push({ chord: walked[v].els[w], tick: wt[w] });
+                        if (mapHas(bowing.dots, trk, wt[w])) dotted = true;
                     }
-                    cur.next();
+                } else {
+                    var cur = score.newCursor();
+                    cur.staffIdx = st; cur.voice = v;
+                    seek(cur, sl.from);
+                    while (cur.segment && cur.tick <= sl.to) {
+                        var el = cur.element;
+                        if (el && el.type === env.CHORD && cur.tick >= sl.from) {
+                            chords.push({ chord: el, tick: cur.tick });
+                            if (mapHas(bowing.dots, trk, cur.tick)) dotted = true;
+                        }
+                        cur.next();
+                    }
                 }
                 if (chords.length < 2) continue;
-                var verdict, reason;
-                if (dotted) {
-                    var jete = divAt(on, sl.from), limit, label;
-                    if (jete) {
-                        limit = S.jeteLimit(instr);
-                        label = "jeté: ";
-                    } else {
-                        var loud = S.isLoud(valueAt(dyn, sl.from, 0));
-                        limit = { max: loud ? S.GROUP_STACCATO_LIMIT.loud : S.GROUP_STACCATO_LIMIT.soft,
-                                  verdict: S.GROUP_STACCATO_LIMIT.verdict };
-                        label = "slurred staccato" + (loud ? " at f" : "") + ": ";
-                    }
-                    counts[jete ? "jete" : "groups"]++;
+                var verdict, reason, kind;
+                // A section's jeté stroke is judged by its note count only. Everything else
+                // — legato, louré, slurred staccato, and a single player's jeté — is one bow
+                // and is timed (S11); a section's slurred staccato also has a note limit.
+                var section = !!instr.section, jeteText = divAt(on, sl.from);
+                var jeteStroke = dotted && section && jeteText;
+                if (jeteStroke) {
+                    var limit = S.jeteLimit(instr);
+                    counts.jete++;
                     if (chords.length <= limit.max) continue;
-                    counts[jete ? "jeteFlagged" : "groupsFlagged"]++;
+                    counts.jeteFlagged++;
                     verdict = limit.verdict;
-                    reason = label + chords.length + " notes on one bow (max " + limit.max + ")";
+                    kind = "jete";
+                    reason = "jeté: " + chords.length + " notes on one bow (section max " + limit.max + ")";
                 } else {
+                    var group = null, timed = null;
+                    if (dotted && section && !jeteText) {
+                        var loud = S.isLoud(valueAt(dyn, sl.from, 0));
+                        var gmax = loud ? S.GROUP_STACCATO_LIMIT.loud : S.GROUP_STACCATO_LIMIT.soft;
+                        counts.groups++;
+                        if (chords.length > gmax) {
+                            counts.groupsFlagged++;
+                            group = { verdict: S.GROUP_STACCATO_LIMIT.verdict,
+                                      reason: "slurred staccato" + (loud ? " at f" : "") + ": " + chords.length +
+                                              " notes on one bow (section max " + gmax + ")" };
+                        }
+                    }
                     if (!tempo) tempo = tempoMap(score, env, range);
                     var endTick = strokeEnd(chords[chords.length - 1]);
                     var cuts = [];
                     for (var q = 0; q < chords.length; q++) cuts.push(chords[q].tick);
                     var use = bowUse(instr, dyn, bowing.hairpins[st] || [], tempo, sl.from, endTick, cuts);
-                    if (!use) continue;
-                    counts.slurs++;
-                    if (use.warn <= 1 + 1e-9) continue;
-                    counts.slursFlagged++;
-                    var red = use.red > 1 + 1e-9;
-                    verdict = red ? "impossible" : "outOfReach";
-                    if (use.tiers.length === 1) {
-                        var bl = S.bowLimit(instr, use.tiers[0]);
-                        reason = "slur " + fmtSeconds(use.secs) + " at " + use.tiers[0] + " (" +
-                                 (red ? "longest one bow can last " + fmtSeconds(bl.red)
-                                      : "max " + fmtSeconds(bl.warn)) + ")";
+                    if (use) {
+                        counts.slurs++;
+                        if (use.warn > 1 + 1e-9) {
+                            counts.slursFlagged++;
+                            var red = use.red > 1 + 1e-9, tr;
+                            if (use.tiers.length === 1) {
+                                var bl = S.bowLimit(instr, use.tiers[0]);
+                                tr = "slur " + fmtSeconds(use.secs) + " at " + use.tiers[0] + " (" +
+                                     (red ? "longest one bow can last " + fmtSeconds(bl.red)
+                                          : "max " + fmtSeconds(bl.warn)) + ")";
+                            } else {
+                                tr = "slur " + fmtSeconds(use.secs) + ", " + use.tiers[0] + "–" +
+                                     use.tiers[use.tiers.length - 1] + " (needs " +
+                                     Math.round((red ? use.red : use.warn) * 100) + "% of " +
+                                     (red ? "the longest bow" : "a comfortable bow") + ")";
+                            }
+                            timed = { verdict: red ? "impossible" : "outOfReach", reason: tr };
+                        }
+                    }
+                    if (!group && !timed) continue;
+                    if (group && timed) {           // one row for the stroke, the worse colour
+                        verdict = timed.verdict === "impossible" ? "impossible" : group.verdict;
+                        reason = group.reason + "; " + timed.reason;
+                        kind = "group";
+                    } else if (group) {
+                        verdict = group.verdict; reason = group.reason; kind = "group";
                     } else {
-                        reason = "slur " + fmtSeconds(use.secs) + ", " + use.tiers[0] + "–" +
-                                 use.tiers[use.tiers.length - 1] + " (needs " +
-                                 Math.round((red ? use.red : use.warn) * 100) + "% of " +
-                                 (red ? "the longest bow" : "a comfortable bow") + ")";
+                        verdict = timed.verdict; reason = timed.reason; kind = "slur";
                     }
                 }
                 var color = S.COLOR[verdict], names = [];
                 var rng = ranges ? rangeAt(ranges, instrList, st, sl.from) : null;
+                // colour the notes tied on from the stroke's last chord too: they sound on
+                // the same bow (they are not counted or named)
+                var lastTick = strokeLastTick(chords[chords.length - 1]), named = chords.length;
+                if (lastTick > sl.to) {
+                    var tc = score.newCursor();
+                    tc.staffIdx = st; tc.voice = v;
+                    seek(tc, sl.to + 1);
+                    while (tc.segment && tc.tick <= lastTick) {
+                        if (tc.tick > sl.to && tc.element && tc.element.type === env.CHORD)
+                            chords.push({ chord: tc.element, tick: tc.tick });
+                        tc.next();
+                    }
+                }
                 for (var c = 0; c < chords.length; c++) {
                     var ns = chords[c].chord.notes, top = -1;
                     for (var n = 0; n < ns.length; n++) {
                         var p = ns[n].pitch;
                         if (p > top) top = p;
-                        var prev = marked[trk + "|" + chords[c].tick + "|-1|" + p];
+                        var prev = marked[trk] ? marked[trk][chords[c].tick + "|-1|" + p] : undefined;
                         if (prev === S.COLOR.impossible) continue;
                         if (prev === undefined && String(ns[n].color).toLowerCase() === S.COLOR.impossible &&
                             from >= 0 && (chords[c].tick < from || chords[c].tick > to)) continue;
                         markNote(ns[n], p, color, rng, trk, chords[c].tick, -1);
                     }
-                    names.push(S.noteName(top));
+                    if (c < named) names.push(S.noteName(top));
                 }
-                var noteText = dotted ? names.join(" ")
+                var noteText = kind === "jete" || kind === "group" ? names.join(" ")
                              : names[0] + " … " + names[names.length - 1] + " (" + names.length + " notes)";
                 if (from < 0 || sl.from >= from)
                     rows.push({ bar: barOf(starts, sl.from), tick: sl.from, staff: info.name,
-                                verdict: verdict, reason: reason,
-                                notes: noteText, track: trk, grace: -1 });
+                                kind: kind, verdict: verdict, reason: reason,
+                                notes: noteText, track: trk, grace: -1,
+                                tickEnd: lastTick });
             }
         }
+    }
+
+    // S13: every "between notes" tremolo from the copy — the chord it sits on and the next
+    // chord in the same voice. Single notes only (a tremolo between double stops is not
+    // judged), no harmonics.
+    function checkTremolos(st, info, instrList, markNote, walked) {
+        for (var v = 0; v < 4; v++) {
+            var trk = st * 4 + v, set = bowing.tremolos[trk];
+            if (!set) continue;
+            for (var key in set) {
+                var t0 = parseInt(key);
+                if (from >= 0 && (t0 < from || t0 > to)) continue;
+                var instr = instrAt(instrList, t0);
+                if (!instr || !S.jeteLimit(instr)) continue;
+                var pair = tremoloPair(st, v, t0, walked[v]);
+                if (!pair) continue;
+                var na = pair[0].chord.notes, nb = pair[1].chord.notes;
+                if (na.length !== 1 || nb.length !== 1) continue;
+                if (na[0].headGroup === env.DIAMOND || nb[0].headGroup === env.DIAMOND) continue;
+                var res = S.fingeredTremolo(instr, na[0].pitch, nb[0].pitch);
+                counts.tremolos++;
+                if (res.verdict === "fine") continue;
+                var red = res.verdict === "impossible";
+                counts[red ? "tremImpossible" : "tremAcross"]++;
+                var color = S.COLOR[res.verdict];
+                var rng = ranges ? rangeAt(ranges, instrList, st, t0) : null;
+                var both = [pair[0], pair[1]];
+                for (var k = 0; k < 2; k++) {
+                    var nn = both[k].chord.notes[0], prev = marked[trk] ? marked[trk][both[k].tick + "|-1|" + nn.pitch] : undefined;
+                    if (prev === S.COLOR.impossible) continue;
+                    markNote(nn, nn.pitch, color, rng, trk, both[k].tick, -1);
+                }
+                var reason = red
+                    ? "fingered tremolo too wide (" + S.intervalName(res.interval) + ")"
+                    : "fingered tremolo across strings " + S.stringName(instr.strings[res.strings[0]]) + "–" +
+                      S.stringName(instr.strings[res.strings[1]]) + " (" + S.intervalName(res.interval) + ")";
+                if (from < 0 || t0 >= from)
+                    rows.push({ bar: barOf(starts, t0), tick: t0, staff: info.name, kind: "tremolo",
+                                verdict: res.verdict, reason: reason,
+                                notes: S.noteName(na[0].pitch) + " ↔ " + S.noteName(nb[0].pitch),
+                                track: trk, grace: -1, tickEnd: pair[1].tick });
+            }
+        }
+    }
+
+    // The tremolo's chord at t0 and the next chord in the same voice.
+    function tremoloPair(st, v, t0, seen) {
+        var wt = seen ? seen.ticks : [], lo = 0, hi = wt.length;
+        while (lo < hi) { var mid = (lo + hi) >> 1; if (wt[mid] < t0) lo = mid + 1; else hi = mid; }
+        if (lo < wt.length && wt[lo] === t0 && lo + 1 < wt.length)
+            return [{ chord: seen.els[lo], tick: t0 }, { chord: seen.els[lo + 1], tick: wt[lo + 1] }];
+        var cur = score.newCursor(), out = [];                // outside the walked bars
+        cur.staffIdx = st; cur.voice = v;
+        seek(cur, t0);
+        while (cur.segment && out.length < 2) {
+            if (cur.tick >= t0 && cur.element && cur.element.type === env.CHORD)
+                out.push({ chord: cur.element, tick: cur.tick });
+            cur.next();
+        }
+        return out.length === 2 && out[0].tick === t0 ? out : null;
+    }
+
+    // Tick of the last chord a stroke sounds on: its last chord, or the last chord
+    // tied on from it. Rows carry it as tickEnd so every note of the stroke finds its row.
+    function strokeLastTick(last) {
+        var t = last.tick, ns = last.chord.notes;
+        for (var k = 0; k < ns.length; k++) {
+            try {
+                var lt = ns[k].lastTiedNote;
+                if (lt && lt.parent && lt.parent.parent.tick > t) t = lt.parent.parent.tick;
+            } catch (e) {}
+        }
+        return t;
     }
 
     // End tick of a stroke: the end of its last chord, or of the last note tied on
@@ -712,12 +1045,14 @@ function analyse(score, env, range, circles, ranges, bowing) {
     // the hairpin takes over from there. Stretches are cut at every chord, dynamic and
     // hairpin end, and a stretch inside a hairpin is sampled in 8 equal parts.
     // Returns { secs, warn, red, tiers: [tiers used, soft to loud] } or null.
-    function bowUse(instr, dyn, hairpins, tempo, t0, t1, cuts) {
+    function bowUse(instr, dyn, allHairpins, tempo, t0, t1, cuts) {
         if (!S.bowLimit(instr, "mf")) return null;
-        var pts = [t0, t1];
+        var pts = [t0, t1], hairpins = [];
         function addCut(t) { if (t > t0 && t < t1) pts.push(t); }
         for (var a = 0; a < cuts.length; a++) addCut(cuts[a]);
-        for (var b = 0; b < dyn.length; b++) addCut(dyn[b].tick);
+        for (var b = stateIndex(dyn, t0) + 1; b < dyn.length && dyn[b].tick < t1; b++) addCut(dyn[b].tick);
+        for (var h0 = 0; h0 < allHairpins.length; h0++)       // only hairpins touching the stroke
+            if (allHairpins[h0].from < t1 && allHairpins[h0].to > t0) hairpins.push(allHairpins[h0]);
         for (var c = 0; c < hairpins.length; c++) { addCut(hairpins[c].from); addCut(hairpins[c].to); }
         pts.sort(function (x, y) { return x - y; });
         var res = { secs: 0, warn: 0, red: 0, tiers: [] }, seen = {};
@@ -748,20 +1083,52 @@ function analyse(score, env, range, circles, ranges, bowing) {
         for (var h = 0; h < hairpins.length; h++) {
             var hp = hairpins[h];
             if (!(hp.from <= t && t < hp.to)) continue;
-            var fresh = false;                              // a dynamic inside the hairpin wins
-            for (var d = 0; d < dyn.length; d++) if (dyn[d].tick > hp.from && dyn[d].tick <= t) fresh = true;
-            if (fresh) continue;
+            if (stateIndex(dyn, t) > stateIndex(dyn, hp.from)) continue;   // a dynamic inside the hairpin wins
             var v0 = valueAt(dyn, hp.from, S.DEFAULT_VELOCITY), v1 = v0 + hp.change;
-            for (var e = 0; e < dyn.length; e++)
-                if (dyn[e].tick >= hp.to) {
-                    if (hp.cresc ? dyn[e].on > v0 : dyn[e].on < v0) v1 = dyn[e].on;
-                    break;
-                }
+            var e = stateIndex(dyn, hp.to - 1) + 1;                        // first dynamic at or after the end
+            if (e < dyn.length && (hp.cresc ? dyn[e].on > v0 : dyn[e].on < v0)) v1 = dyn[e].on;
             return v0 + (v1 - v0) * (t - hp.from) / (hp.to - hp.from);
         }
         return base;
     }
 
+}
+
+// --- status line ---------------------------------------------------------
+// Only problems, and only the kinds that occur: a count of 0 is left out, and the
+// informational tallies (open strings, playable chords, div. skips) are not shown.
+// Counts for problemSummary from the rows themselves — the rows the panel shows, whatever
+// mix of whole-score and partial passes produced them.
+function countRows(rows) {
+    var c = { impossible: 0, outOfReach: 0, harmBad: 0, harmRisky: 0, jeteFlagged: 0, groupsFlagged: 0,
+              slursFlagged: 0, fastFlagged: 0, tremImpossible: 0, tremAcross: 0 };
+    for (var i = 0; i < rows.length; i++) {
+        var r = rows[i];
+        if (r.kind === "stop") c[r.verdict === "impossible" ? "impossible" : "outOfReach"]++;
+        else if (r.kind === "harmonic") c[r.verdict === "impossible" ? "harmBad" : "harmRisky"]++;
+        else if (r.kind === "jete") c.jeteFlagged++;
+        else if (r.kind === "group") c.groupsFlagged++;
+        else if (r.kind === "slur") c.slursFlagged++;
+        else if (r.kind === "fast") c.fastFlagged++;
+        else if (r.kind === "tremolo") c[r.verdict === "impossible" ? "tremImpossible" : "tremAcross"]++;
+    }
+    return c;
+}
+
+function problemSummary(c) {
+    var parts = [];
+    function add(n, one, many) { if (n > 0) parts.push(n + " " + (n === 1 ? one : many)); }
+    add(c.impossible,    "unplayable chord",         "unplayable chords");
+    add(c.outOfReach,    "chord needs a stretch",    "chords need a stretch");
+    add(c.harmBad,       "impossible harmonic",      "impossible harmonics");
+    add(c.harmRisky,     "risky harmonic",           "risky harmonics");
+    add(c.jeteFlagged,   "jeté stroke too long",     "jeté strokes too long");
+    add(c.groupsFlagged, "staccato group too long",   "staccato groups too long");
+    add(c.slursFlagged,  "slur too long",             "slurs too long");
+    add(c.fastFlagged,   "fast bass passage",         "fast bass passages");
+    add(c.tremImpossible, "fingered tremolo too wide", "fingered tremolos too wide");
+    add(c.tremAcross,    "fingered tremolo across strings", "fingered tremolos across strings");
+    return parts.length ? parts.join(" · ") : "no problems found";
 }
 
 // --- selection sync ------------------------------------------------------
@@ -796,6 +1163,61 @@ function selectChord(score, env, row) {
     s.clear();
     for (var i = 0; i < ch.notes.length; i++) s.select(ch.notes[i], i > 0);
     return true;
+}
+
+// Select everything a results row is about: every note of its chord, or — for a
+// stroke row (a slur or jeté stroke) — every note of every chord from its
+// first chord to tickEnd, grace notes included. Returns false if the first chord has
+// gone.
+function selectRow(score, env, row) {
+    var end = row.tickEnd === undefined ? row.tick : row.tickEnd;
+    if (row.grace >= 0 || end <= row.tick) return selectChord(score, env, row);
+    if (!findChord(score, env, row.track, row.tick, -1)) return false;
+    var cur = score.newCursor(), s = score.selection, first = true;
+    cur.staffIdx = row.track >> 2;
+    cur.voice = row.track % 4;
+    seek(cur, row.tick);
+    s.clear();
+    while (cur.segment && cur.tick <= end) {
+        var el = cur.element;
+        if (el && el.type === env.CHORD && cur.tick >= row.tick) {
+            var parts = [], gs = null;
+            try { gs = el.graceNotes } catch (e) {}
+            if (gs) for (var g = 0; g < gs.length; g++) parts.push(gs[g]);
+            parts.push(el);
+            for (var p = 0; p < parts.length; p++)
+                for (var n = 0; n < parts[p].notes.length; n++) {
+                    s.select(parts[p].notes[n], !first);
+                    first = false;
+                }
+        }
+        cur.next();
+    }
+    return !first;
+}
+
+// How well a results row matches a selected chord key: 2 = the row's own chord,
+// 1 = a chord inside the row's stroke (between tick and tickEnd), 0 = no match.
+function rowMatch(row, key) {
+    if (!key || row.track !== key.track) return 0;
+    if (row.tick === key.tick && row.grace === key.grace) return 2;
+    var end = row.tickEnd === undefined ? row.tick : row.tickEnd;
+    if (end > row.tick && key.tick >= row.tick && key.tick <= end) return 1;
+    return 0;
+}
+
+// Does the selection hold notes of more than one chord? (Then no fingerboard.)
+function selectionSpansChords(score, env) {
+    var els = null, first = null;
+    try { els = score.selection.elements } catch (e) { return false; }
+    if (!els) return false;
+    for (var i = 0; i < els.length; i++) {
+        var k = keyOfElements([els[i]], env);
+        if (!k) continue;
+        if (!first) first = k;
+        else if (k.tick !== first.tick || k.track !== first.track || k.grace !== first.grace) return true;
+    }
+    return false;
 }
 
 // The chord behind the current selection: { track, tick, grace, chord } or null.
@@ -851,7 +1273,7 @@ function inspectChord(score, env, key, circles) {
     var instr = instrAt(instrumentsOf(score, env, st, info.part, here), key.tick);
     if (!instr) return info.name + " — not a bowed string instrument here";
 
-    var chordCircle = !!(circles && circles[key.track + "|" + key.tick]);
+    var chordCircle = mapHas(circles, key.track, key.tick);
     var ns = key.chord.notes, list = [], anyD = false, anyC = chordCircle;
     for (var i = 0; i < ns.length; i++) {
         var d = ns[i].headGroup === env.DIAMOND;
@@ -864,6 +1286,10 @@ function inspectChord(score, env, key, circles) {
 
     if (anyD || anyC) {
         var h = H.classify(instr, list);
+        if (h && h.verdict !== "impossible") {
+            var all = H.inspectNatural(instr, list);        // every string, node and sounding pitch
+            if (all) return (h.verdict === "ok" ? "natural harmonic" : h.reason) + "\n" + all;
+        }
         if (h) return h.detail + " — " + (h.verdict === "ok" ? "valid harmonic" : h.reason);
     }
     if (list.length === 1) {
@@ -895,7 +1321,7 @@ function chordGeometry(score, env, key, circles) {
     if (!instr) return null;
     var ns = key.chord.notes;
     if (!ns || ns.length < 2) return null;
-    var chordCircle = !!(circles && circles[key.track + "|" + key.tick]);
+    var chordCircle = mapHas(circles, key.track, key.tick);
     var pitches = [];
     for (var i = 0; i < ns.length; i++) {
         if (ns[i].headGroup === env.DIAMOND || chordCircle || H.hasCircle(ns[i])) return null;
@@ -1115,10 +1541,12 @@ function clearMarks(score, env, opts) {
     var useCmd = !opts || opts.command !== false;
     var from = opts && opts.from >= 0 ? opts.from : -1;
     var to   = opts && opts.to   >= 0 ? opts.to   : -1;
+    var onlyStaves = opts && opts.staves ? opts.staves : null;
     var cleared = 0, uncovered = 0;
     if (useCmd) score.startCmd();
     for (var st = 0; st < score.nstaves; st++)
         for (var v = 0; v < 4; v++) {
+            if (onlyStaves && onlyStaves.indexOf(st) < 0) break;
             var cur = score.newCursor();
             cur.staffIdx = st; cur.voice = v;
             seek(cur, from);

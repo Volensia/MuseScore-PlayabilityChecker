@@ -50,7 +50,8 @@ function isOurColor(c) {
 //
 // span0    the 1st–4th finger stretch on ONE string, at the nut, in semitones.
 //          Forsyth's headline figure. Not used by the multiple-stop rules (each
-//          note of a stop is on its own string) but kept as the sourced anchor.
+//          note of a stop is on its own string); used by the fingered-tremolo check
+//          (S13) for two notes on one string.
 // crossMax how much further up the neck the higher string may be stopped than
 //          its neighbour, at the nut, in semitones. Forsyth gives this as a
 //          sounding interval with the 1st finger on the lower string and the 4th
@@ -78,7 +79,7 @@ var NAME_HINTS = [
     [/violin|violine|geige|\bvln\b/,          "strings.violin"]
 ];
 
-function lookup(instrumentId, longName) {
+function baseInstrument(instrumentId, longName) {
     if (instrumentId && INSTRUMENTS[instrumentId]) return INSTRUMENTS[instrumentId];
     if (instrumentId)
         for (var key in INSTRUMENTS)                    // e.g. "strings.violin-section"
@@ -87,6 +88,41 @@ function lookup(instrumentId, longName) {
     for (var i = 0; i < NAME_HINTS.length; i++)
         if (NAME_HINTS[i][0].test(n)) return INSTRUMENTS[NAME_HINTS[i][1]];
     return null;
+}
+
+// Section or single player? Orchestral sources and solo/chamber sources give different
+// limits (jeté, slurred staccato, fast bass passages), so every instrument carries
+// `section`. A part is a section when any of these says so (user's rule, 2026-09-14):
+//   - a plural name: Violins, Violas, Violoncellos/Cellos/Celli, Contrabasses,
+//     Double Basses, Basses (also "Violins I", "Violini")
+//   - MuseScore's section instrument id "strings.group" (Violins, Violas, Violoncellos,
+//     Contrabasses in instruments.xml)
+//   - a section sound on the arco channel: GM 48–51 (String Ensemble 1/2, Synth Strings
+//     1/2); the single instruments use 40–43 (Violin, Viola, Cello, Contrabass)
+// Otherwise it is a single player (solo or chamber).
+var SECTION_NAME = /(^|[^a-z])(violins|violini|violas|viole|violoncellos|violoncelli|cellos|celli|contrabasses|contrabassi|double[\s-]*basses|basses|kontrabässe|bratschen|violinen)([^a-z]|$)/;
+var SECTION_PROGRAMS = { 48: true, 49: true, 50: true, 51: true };
+function isSection(instrumentId, longName, program) {
+    if (instrumentId === "strings.group") return true;
+    if (SECTION_NAME.test((longName || "").toLowerCase())) return true;
+    return program !== undefined && program !== null && !!SECTION_PROGRAMS[program];
+}
+
+// The instrument table entry with its role: a copy per instrument and role, so the
+// shared INSTRUMENTS entries are never changed.
+var _roles = {};
+function lookup(instrumentId, longName, program) {
+    var base = baseInstrument(instrumentId, longName);
+    if (!base) return null;
+    var section = isSection(instrumentId, longName, program);
+    var key = base.name + (section ? "|section" : "|single");
+    if (!_roles[key]) {
+        var o = {};
+        for (var f in base) o[f] = base[f];
+        o.section = section;
+        _roles[key] = o;
+    }
+    return _roles[key];
 }
 
 // one decimal, no trailing ".0" — the Python cross-check model formats to match
@@ -117,9 +153,12 @@ function openStringIndex(instr, pitch) {
 //
 // The string length cancels: H/L = 1 − 2^(−crossMax/12), so no mensur estimate
 // enters the rules. At pos = 0 this returns crossMax exactly.
-function reachAt(instr, pos) {
-    if (!(pos > 0)) return instr.crossMax;
-    var r = Math.pow(2, -pos / 12) - 1 + Math.pow(2, -instr.crossMax / 12);
+function reachAt(instr, pos) { return spanAt(instr.crossMax, pos); }
+
+// The same geometry for any stretch given at the nut: `limit` semitones at pos 0.
+function spanAt(limit, pos) {
+    if (!(pos > 0)) return limit;
+    var r = Math.pow(2, -pos / 12) - 1 + Math.pow(2, -limit / 12);
     if (r <= 0.03) return 24;                           // hand is far up: unrestricted
     return (-12 * Math.log(r) / Math.LN2) - pos;
 }
@@ -243,11 +282,12 @@ function divState(text) {
 // Adler's cancel words (p. 33: ord., naturale, normale, in modo ordinario) or a
 // change to another stroke turn it off.
 //
-// Limits, Adler p. 27: in the orchestra "no more than three bouncing notes at a time"
-// — a suggestion, since solo players manage more — so more than 3 on violin and
-// viola is a warning. Cello and bass bows are shorter: "three, or at most four ...
-// are the limit of what can be played", so more than 4 there is flagged as
-// unplayable. A 4-note stroke on cello or bass is within Adler's limit.
+// Limit (revision 2026-09-14, user's choice) — SECTIONS only: more than 6 notes on one
+// stroke is a warning on every bowed string — Sevsay p. 18 (two to six on a down-bow) and Wagner
+// p. 40 (groups of three to six). No hard limit: Adler p. 27 suggests 3 in the
+// orchestra (4 on cello and bass, "the limit of what can be played"), but also says
+// solo players manage more, and Auer p. 60 teaches up to 8. A single player's jeté
+// stroke has no note limit and is timed like any other slur (S11).
 //
 // Saltato / saltando is the Italian for sautillé (Forsyth p. 341 footnote), one note
 // per bow, so it does not switch jeté on.
@@ -332,6 +372,26 @@ var TIER_ORDER = { pp: 0, p: 1, mf: 2, f: 3, ff: 4 };
 var BOW_SECONDS = { pp: { warn: 12,  red: 15 }, p:  { warn: 6,   red: 12 },
                     mf: { warn: 3,   red: 6 },  f:  { warn: 2.5, red: 4.5 },
                     ff: { warn: 1.5, red: 3 } };
+// Slurred staccato (dots under a slur, no jeté text) — SECTIONS only. Wagner p. 35:
+// "four to six notes in one bow is a safe maximum for the softer dynamics in moderate
+// tempos. Three notes in one bow should not be exceeded in the forte-fortissimo levels."
+// Forsyth p. 344 agrees on the loud side ("three or four ... can safely be hazarded
+// anywhere"); Sevsay p. 13 is stricter for soft playing ("in orchestral music more than
+// four notes in one bow are difficult to play"). Soloists: no count limit — Sevsay p. 13
+// allows groups of up to 8, Stoeving pp. 105, 110 teaches 13–17. Loud = f or louder
+// (settled velocity >= 89); before any dynamic the soft limit applies.
+var GROUP_STACCATO_LIMIT = { soft: 6, loud: 3, verdict: "outOfReach" };
+
+// Fast passages — double bass SECTIONS only. No source gives a speed; the composers'
+// own metronome marks on the passages the books discuss do (SPEC-strings.md, S12):
+// sustained runs faster than 10 notes a second blur or are avoided (Beethoven 4 finale,
+// Adler p. 84; Beethoven 6 storm, Prout p. 27; Beethoven 4 i, Jadassohn p. 318), short
+// ones at 10.7–13.3 are fine (Forsyth p. 454; Jadassohn p. 175) and runs at 9.6 are
+// model passages (Kennan p. 26). A run is notes shorter than 0.1 s each, one after the
+// other; warn when it lasts longer than 1.5 s. Both numbers are placed between those
+// examples, not stated by any source.
+var FAST_RUN = { maxNoteSeconds: 0.1, maxRunSeconds: 1.5, verdict: "outOfReach" };
+
 var BOW_FACTOR = { "Violin": 1, "Viola": 1, "Cello": 0.6, "Double bass": 0.6 };
 var DEFAULT_VELOCITY = 80;
 function bowLimit(instr, tier) {
@@ -340,18 +400,11 @@ function bowLimit(instr, tier) {
     return { warn: BOW_SECONDS[tier].warn * f, red: BOW_SECONDS[tier].red * f };
 }
 
-// Group staccato — dots under a slur with no jeté asked for. Wagner p. 35: "four to
-// six notes in one bow is a safe maximum for the softer dynamics in moderate tempos.
-// Three notes in one bow should not be exceeded in the forte-fortissimo levels."
-// Same for every bowed string (he gives no per-instrument figures). Before any
-// dynamic the soft limit applies. Tempo is not read.
-var GROUP_STACCATO_LIMIT = { soft: 6, loud: 3, verdict: "outOfReach" };
-
 var JETE_LIMIT = {
-    "Violin":      { max: 3, verdict: "outOfReach" },
-    "Viola":       { max: 3, verdict: "outOfReach" },
-    "Cello":       { max: 4, verdict: "impossible" },
-    "Double bass": { max: 4, verdict: "impossible" }
+    "Violin":      { max: 6, verdict: "outOfReach" },
+    "Viola":       { max: 6, verdict: "outOfReach" },
+    "Cello":       { max: 6, verdict: "outOfReach" },
+    "Double bass": { max: 6, verdict: "outOfReach" }
 };
 function jeteLimit(instr) { return instr ? JETE_LIMIT[instr.name] || null : null; }
 
@@ -361,4 +414,49 @@ function isStaccatoSymbol(sym) {
     if (sym === undefined || sym === null) return false;
     var s = String(sym);
     return /^artic(Staccato|Staccatissimo|AccentStaccato|MarcatoStaccato)/.test(s);
+}
+
+// --- S13 fingered tremolo -----------------------------------------------------
+// Two notes alternated under one bow ("between notes" tremolo). Forsyth gives the
+// widest interval the 1st and 4th fingers stop in the lower positions — on one string
+// (span0: vn aug 4th, va P4, vc M3, cb whole tone; pp. 357 fn, 391, 425, 441) and with
+// the 1st finger on a string and the 4th on the next higher one (crossMax, see above).
+// Both scale with hand position exactly like the multiple-stop reach (spanAt).
+//
+//   fine       one note is an open string and the other sits on that string or the next
+//              higher one; or both notes fit on ONE string at that position
+//   outOfReach both notes stopped, only on two adjacent strings — possible, but Forsyth:
+//              "a somewhat shabby and ineffective tremolo" (p. 355-357), "should be used
+//              with caution, and not employed if … any other arrangement" (p. 357 fn)
+//   impossible no fingering reaches
+// Returns { verdict, strings: [lowerIdx, upperIdx] | null, interval }.
+function fingeredTremolo(instr, a, b) {
+    var low = Math.min(a, b), high = Math.max(a, b), st = instr.strings, n = st.length;
+    var res = { verdict: "impossible", strings: null, interval: high - low };
+    if (high === low) { res.verdict = "fine"; return res; }
+    var across = null;
+    for (var s = 0; s < n; s++) {
+        var offLow = low - st[s];
+        if (offLow < 0) continue;                               // the lower note is not on string s
+        // both on string s
+        var offHigh = high - st[s];
+        if (offLow === 0 || offHigh - offLow <= spanAt(instr.span0, offLow) + 1e-9) {
+            res.verdict = "fine"; res.strings = [s, s]; return res;
+        }
+        // upper note on the next higher string (index s - 1)
+        if (s > 0 && high >= st[s - 1]) {
+            var offUp = high - st[s - 1];
+            if (offUp === 0) { res.verdict = "fine"; res.strings = [s, s - 1]; return res; }
+            if (!across && Math.abs(offUp - offLow) <= spanAt(instr.crossMax, Math.min(offLow, offUp)) + 1e-9)
+                across = [s, s - 1];
+        }
+    }
+    if (across) { res.verdict = "outOfReach"; res.strings = across; }
+    return res;
+}
+
+var INTERVAL_NAMES = ["unison", "minor 2nd", "major 2nd", "minor 3rd", "major 3rd", "perfect 4th", "tritone",
+                      "perfect 5th", "minor 6th", "major 6th", "minor 7th", "major 7th", "octave"];
+function intervalName(semitones) {
+    return semitones <= 12 ? INTERVAL_NAMES[semitones] : semitones + " semitones";
 }

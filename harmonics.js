@@ -131,6 +131,70 @@ function artificial(instr, stopped, touched) {
 }
 
 
+// Every way to play one natural harmonic. atNode: the written pitch is the node
+// (diamond); otherwise it is the sounding pitch (circle). Returns
+// [{ string, partial, nodes: [touched pitches], sounds, solo }], highest string first.
+function naturalOptions(instr, pitch, atNode) {
+    var out = [];
+    for (var i = 0; i < instr.strings.length; i++) {
+        var open = instr.strings[i];
+        if (atNode) {
+            var p = NODES[pitch - open];
+            if (p) out.push({ string: i, partial: p, nodes: [pitch], sounds: open + SOUNDS[p],
+                              solo: pitch - open === SOLO_ONLY });
+            continue;
+        }
+        for (var q in SOUNDS) {
+            if (open + SOUNDS[q] !== pitch) continue;
+            var nodes = [], solo = true;
+            for (var off in NODES)
+                if (NODES[off] === parseInt(q, 10)) {
+                    nodes.push(open + parseInt(off, 10));
+                    if (parseInt(off, 10) !== SOLO_ONLY) solo = false;
+                }
+            nodes.sort(function (a, b) { return a - b; });
+            out.push({ string: i, partial: parseInt(q, 10), nodes: nodes, sounds: pitch, solo: solo });
+        }
+    }
+    return out;
+}
+
+// one line per string: "A string (II): node A5, sounds A6"
+function describeOptions(instr, opts) {
+    var parts = [];
+    for (var i = 0; i < opts.length; i++) {
+        var o = opts[i], names = [];
+        for (var k = 0; k < o.nodes.length; k++)
+            names.push(S.noteName(o.nodes[k]) + (o.nodes[k] - instr.strings[o.string] === SOLO_ONLY &&
+                                                 o.nodes.length > 1 ? " (solo only)" : ""));
+        parts.push(S.stringName(instr.strings[o.string]) + " string (" + ROMAN[o.string] + "): node " +
+                   names.join(" or ") + ", sounds " + S.noteName(o.sounds) + (o.solo ? " (solo only)" : ""));
+    }
+    return parts.join("\n");
+}
+
+// The Selected line for a natural harmonic chord: every string, node and sounding
+// pitch for each note. null when the chord is not a readable natural harmonic.
+function inspectNatural(instr, list) {
+    var diamonds = 0, circles = 0, i;
+    for (i = 0; i < list.length; i++) {
+        if (list[i].diamond) diamonds++;
+        if (list[i].circle) circles++;
+    }
+    var atNode;
+    if (diamonds && diamonds === list.length) atNode = true;        // node notation
+    else if (!diamonds && circles) atNode = false;                  // sounding notation
+    else return null;
+    var parts = [];
+    for (i = 0; i < list.length; i++) {
+        var opts = naturalOptions(instr, list[i].pitch, atNode);
+        if (!opts.length) return null;
+        parts.push((list.length > 1 ? S.noteName(list[i].pitch) + ":\n" : "") + describeOptions(instr, opts));
+    }
+    return parts.join("\n");
+}
+
+
 function describeNatural(res, pitch) {
     if (!res.info) return S.noteName(pitch) + " (—)";
     return S.noteName(pitch) + " (" + ROMAN[res.info.string] + ") partial " +

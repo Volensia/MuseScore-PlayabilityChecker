@@ -16,6 +16,7 @@ import FileIO 3.0
 import "analyse.js" as A
 import "strings.js" as S
 import "fingerboard.js" as F
+import "copyscan.js" as CS
 
 MuseScore {
     menuPath: "Plugins.Playability Checker.Live check (strings)"
@@ -31,7 +32,7 @@ MuseScore {
                          DIAMOND: NoteHeadGroup.HEAD_DIAMOND,
                          NORMAL: NoteHeadGroup.HEAD_NORMAL,
                          INSTRUMENT_CHANGE: Element.INSTRUMENT_CHANGE,
-                         ARTICULATION: Element.ARTICULATION, SLUR: Element.SLUR, HAIRPIN: Element.HAIRPIN, TEMPO_TEXT: Element.TEMPO_TEXT,
+                         ARTICULATION: Element.ARTICULATION, SLUR: Element.SLUR, HAIRPIN: Element.HAIRPIN, TEMPO_TEXT: Element.TEMPO_TEXT, TREMOLO: Element.TREMOLO,
                          SYM: { black: SymId.noteheadBlack, half: SymId.noteheadHalf,
                                 whole: SymId.noteheadWhole, breve: SymId.noteheadDoubleWhole,
                                 diamondBlack: SymId.noteheadDiamondBlack,
@@ -39,30 +40,202 @@ MuseScore {
                                 diamondWhole: SymId.noteheadDiamondWhole,
                                 diamondBreve: SymId.noteheadDiamondDoubleWhole } })
 
-    // Instrument ranges, read from a temp copy of the score (the plugin API has no
-    // range properties). Needed to know which notes MuseScore paints over.
+    // ---------------------------------------------------------------- copy reader
+    // Slurs, staccato dots, hairpins, harmonic circles (Articulations palette) and the
+    // instrument ranges are not reachable through the plugin API without a select-all,
+    // which borrows the user's selection. So they are read from a copy of the score
+    // written to the temp folder (writeScore: the score keeps its name, the undo stack is
+    // untouched). See SPEC-strings.md, "Copy reader".
+    //
+    //   when   : at start and on a tab switch; on Re-check / Apply; and after edits, once the
+    //            score has been quiet for copyIdleMs, which follows how long the last copy took
+    //            to write: up to 50 ms (small scores) 400 ms — just after the live pass, so a
+    //            slur change shows within about a second; up to 150 ms 1.5 s; up to 400 ms 5 s;
+    //            slower copies turn the automatic read off and the status line says the slurs
+    //            may be out of date.
+    //   where  : writeScore must run on the main thread — the only unavoidable freeze. The
+    //            scan runs in a WorkerScript; if the worker never answers, it runs on the main
+    //            thread one staff per timer tick instead.
+    //   result : only the staves whose slurs, dots, hairpins or circles changed are
+    //            re-checked.
     property var ranges: null
     property var covers: []             // keys of notes drawn over, for selection changes
     property bool coverOn: true         // draw our colour over MuseScore's range colours
-    FileIO { id: rangeFile }
+    property var circles: null          // track -> tick -> true (from the copy)
+    property var bowing: null           // { slurs, dots, hairpins } (from the copy)
+    property var staffSigs: ({})        // staff -> signature of its maps at the last read
+    property bool copyBusy: false
+    property bool copyPending: false    // another read was asked for while one ran
+    property bool copyDirty: false      // edited since the last read
+    property bool copyAuto: true        // automatic reads after edits (off for slow copies)
+    property int copyIdleMs: 400
+    property int copyId: 0
+    property var copyJob: null          // { id, score, full, command, writeMs, readMs, t0, starts }
+    property int workerState: 0         // 0 untried, 1 answering, -1 not answering
+    property string workerUrl: ""
+    property string copyScanCode: ""    // bundle.py fills this in; the dev build reads copyscan.js
+    FileIO { id: copyFile }
 
-    function readRanges() {
-        if (!curScore || !coverOn) { ranges = null; return; }
-        var base = rangeFile.tempPath() + "/playability-checker-ranges";
-        busy = true;
-        var ok = writeScore(curScore, base, "mscx");   // a copy: the score keeps its name
-        busy = false;
-        if (!ok) { ranges = null; return; }
-        rangeFile.source = base + ".mscx";
-        ranges = A.parseRanges(rangeFile.read());
+    function fileUrl(path) { return (path.charAt(0) === "/" ? "file://" : "file:///") + path; }
+
+    // The worker runs copyscan.js itself, written to the temp folder without its
+    // ".pragma library" line (a WorkerScript file cannot be a QML library).
+    function prepareWorker() {
+        if (workerUrl !== "") return;
+        var code = copyScanCode;
+        if (code === "") {
+            copyFile.source = decodeURIComponent(String(Qt.resolvedUrl("copyscan.js")).replace(/^file:\/\//, ""));
+            code = copyFile.read();
+        }
+        code = code.replace(/^\s*\.pragma\s+library\s*$/m, "");
+        copyFile.source = copyFile.tempPath() + "/playability-checker-worker.js";
+        if (copyFile.write(code)) workerUrl = fileUrl(copyFile.source);
+        else workerState = -1;
+    }
+
+    // Staves that hold a bowed string at any point: the only ones worth scanning.
+    function stringStaves() {
+        var list = [], staves = A.staffInstruments(curScore);
+        for (var st = 0; st < curScore.nstaves; st++) {
+            if (!staves[st]) continue;
+            var inst = A.instrumentsOf(curScore, env, st, staves[st].part, null);
+            for (var i = 0; i < inst.length; i++) if (inst[i].instr) { list.push(st); break; }
+        }
+        return list;
+    }
+
+    // Ask for a read. opts: { full: re-check every staff afterwards, command: undoable }.
+    function requestCopy(opts) {
+        if (!curScore) return;
+        if (copyBusy) { copyPending = true; if (opts && opts.full) copyJob.full = true; return; }
+        copyBusy = true;
+        copyDirty = false;
+        copyJob = { id: ++copyId, score: curScore.scoreName, full: !!(opts && opts.full),
+                    command: !!(opts && opts.command) };
+        if (lastWriteMs > 100) statusHint = "updating…";   // a noticeable write is coming
+        copyWrite.start();                  // next event-loop turn: lets "updating…" paint first
+    }
+    property int lastWriteMs: 0
+    property string statusHint: ""
+
+    Timer {
+        id: copyWrite
+        interval: 0
+        onTriggered: {
+            if (!curScore || curScore.scoreName !== copyJob.score) { copyBusy = false; return; }
+            prepareWorker();
+            var base = copyFile.tempPath() + "/playability-checker-copy";
+            var t0 = Date.now();
+            busy = true;
+            var ok = writeScore(curScore, base, "mscx");
+            busy = false;
+            var t1 = Date.now();
+            if (!ok) { copyBusy = false; statusHint = ""; console.log("PlayabilityChecker copy: write failed"); return; }
+            copyFile.source = base + ".mscx";
+            var xml = copyFile.read();
+            var t2 = Date.now();
+            ranges = coverOn ? A.parseRanges(xml) : null;
+            var t3 = Date.now();
+            copyJob.writeMs = t1 - t0; copyJob.readMs = t2 - t1; copyJob.rangeMs = t3 - t2;
+            copyJob.starts = A.barMap(curScore);
+            copyJob.staves = stringStaves();
+            copyJob.t0 = Date.now();
+            lastWriteMs = copyJob.writeMs;
+            if (workerState >= 0 && workerUrl !== "") {
+                copyWorker.sendMessage({ id: copyJob.id, xml: xml, starts: copyJob.starts, staves: copyJob.staves });
+                if (workerState === 0) workerWait.start();
+            } else {
+                startChunkedScan(xml);
+            }
+        }
+    }
+
+    WorkerScript {
+        id: copyWorker
+        source: workerUrl
+        onMessage: {
+            if (!copyJob || messageObject.id !== copyJob.id) return;
+            workerWait.stop();
+            workerState = 1;
+            applyCopy(messageObject.maps, "worker", messageObject.scanMs);
+        }
+    }
+
+    // A worker that has never answered within 5 s is taken as unavailable; the pending
+    // read is finished on the main thread, one staff per timer tick.
+    Timer {
+        id: workerWait
+        interval: 5000
+        onTriggered: {
+            workerState = -1;
+            console.log("PlayabilityChecker copy: background worker did not answer — scanning on the main thread");
+            copyFile.source = copyFile.tempPath() + "/playability-checker-copy.mscx";
+            startChunkedScan(copyFile.read());
+        }
+    }
+
+    property var chunk: null            // { xml, slices, i, out, want, t0 }
+    function startChunkedScan(xml) {
+        var want = {};
+        for (var i = 0; i < copyJob.staves.length; i++) want[copyJob.staves[i]] = true;
+        chunk = { xml: xml, slices: CS.copyStaffSlices(xml), i: 0, out: CS.copyScanEmpty(), want: want, t0: Date.now() };
+        chunkTimer.start();
+    }
+    Timer {
+        id: chunkTimer
+        interval: 1
+        repeat: true
+        onTriggered: {
+            while (chunk.i < chunk.slices.length && !chunk.want[chunk.slices[chunk.i].staff]) chunk.i++;
+            if (chunk.i < chunk.slices.length) {
+                CS.copyScanStaff(chunk.xml, chunk.slices[chunk.i], copyJob.starts, chunk.out);
+                chunk.i++;
+                return;
+            }
+            stop();
+            var maps = CS.copyScanFinish(chunk.out), ms = Date.now() - chunk.t0;
+            chunk = null;
+            applyCopy(maps, "main thread, per staff", ms);
+        }
+    }
+
+    function applyCopy(maps, where, scanMs) {
+        var job = copyJob;
+        copyBusy = false;
+        statusHint = "";
+        if (!curScore || curScore.scoreName !== job.score) { if (copyPending) { copyPending = false; requestCopy({ full: true }); } return; }
+        var sigs = {}, changed = [], first = circles === null;
+        for (var st = 0; st < curScore.nstaves; st++) {
+            sigs[st] = CS.copyStaffSignature(maps, st);
+            if (sigs[st] !== staffSigs[st]) changed.push(st);
+        }
+        circles = maps.circles;
+        bowing = maps.bowing;
+        staffSigs = sigs;
+        // pace the automatic reads by how long this copy took to write
+        copyAuto = job.writeMs <= 400;
+        copyIdleMs = job.writeMs <= 50 ? 400 : job.writeMs <= 150 ? 1500 : 5000;
+        console.log("PlayabilityChecker copy: write " + job.writeMs + " ms, read " + job.readMs + " ms, ranges " +
+                    job.rangeMs + " ms, scan " + scanMs + " ms (" + where + "), " + job.staves.length +
+                    " string staves, changed " + (first ? "all" : changed.length) +
+                    (copyAuto ? "" : " — automatic reads off for this score (slow copy)"));
+        if (job.full || first) check(null, job.command, false);
+        else if (changed.length) check({ from: -1, to: -1, staves: changed }, false, false);
+        else updateStatus();
+        if (copyPending) { copyPending = false; requestCopy({}); }
+    }
+
+    // After an edit: read again once the score has been quiet.
+    Timer {
+        id: copyIdle
+        interval: copyIdleMs
+        onTriggered: if (copyDirty && copyAuto) requestCopy({})
     }
 
     function overlayOpts(command) {
         return { command: command, overlay: coverOn, env: env,
                  newSymbol: function () { return newElement(Element.SYMBOL); } };
     }
-    property var circles: null          // "track|tick" -> true, rebuilt on full checks
-    property var bowing: null           // slurs and staccato dots for S10, rebuilt with circles
     property bool liveOn: true
     property bool busy: false           // re-entry guard: our own writes fire onScoreStateChanged
     property bool syncing: false        // the panel itself is moving a selection
@@ -78,61 +251,51 @@ MuseScore {
 
     ListModel { id: results }
 
-    // Circles from the Articulations palette can only be found with a select-all,
-    // which means borrowing the selection. A range selection cannot be restored
-    // faithfully (startSegment/endSegment read back as null), so doing this
-    // automatically made editing unusable: every typed note lost its selection.
-    // It now runs ONLY on an explicit action — plugin start, Re-check, Apply.
-    // Circles from the Symbols palette need none of this and stay fully live.
-    // Slurs and staccato dots (S10 jeté) come from the same select-all, so a slur
-    // added or removed while typing is only seen after Re-check.
-    function rebuildCircles() {
-        if (!curScore) return;
-        var keep = A.saveSelection(curScore);
-        cmd("select-all");
-        var els = curScore.selection.elements;
-        circles = A.buildCircleMap(els, env);
-        bowing = A.buildBowMap(els, env);
-        A.restoreSelection(curScore, keep);
+    // range: null = whole score, or { from, to } ticks, optionally with staves: [staffIdx]
+    function inRange(track, tick, range) {
+        if (!range) return true;
+        if (range.staves && range.staves.indexOf(track >> 2) < 0) return false;
+        if (range.from >= 0 && (tick < range.from || tick > range.to)) return false;
+        return true;
     }
 
-    function check(range, command, scanCircles) {
+    function check(range, command) {
         if (!curScore) return;
         busy = true;
-        if (scanCircles) rebuildCircles();       // never on an automatic pass
-        busy = false;
-        if (coverOn && (scanCircles || ranges === null)) readRanges();
-        busy = true;
         A.clearMarks(curScore, env, { command: command, from: range ? range.from : -1,
-                                                        to:   range ? range.to   : -1 });
+                                      to: range ? range.to : -1, staves: range ? range.staves : null });
         var out = A.analyse(curScore, env, range, circles, coverOn ? ranges : null, bowing);
         if (out.textsChanged) {             // a div./jeté text moved: later bars change too
             busy = false;
-            check(null, command, false);
+            check(null, command);
             return;
         }
         var applied = A.applyMarks(curScore, out.marks, overlayOpts(command));
+        // Colours written outside a command are not repainted until MuseScore next redraws.
+        // A pass started by an edit gets that redraw anyway; one started by the copy
+        // reader's worker does not, so ask for it.
+        if (!command) A.layoutNow(curScore);
         busy = false;
         passes++;
 
         // covered notes: a partial pass replaces only the keys inside its range
         var keepCovers = [];
-        if (range && range.from >= 0)
+        if (range)
             for (var ci = 0; ci < covers.length; ci++)
-                if (covers[ci].tick < range.from || covers[ci].tick > range.to)
+                if (!inRange(covers[ci].track, covers[ci].tick, range))
                     keepCovers.push(covers[ci]);
         covers = keepCovers.concat(out.covers);
 
         // a partial pass only replaces the rows in its own bar range
         rebuilding = true;
-        if (range && range.from >= 0) {
+        if (range) {
             var kept = [];
             for (var i = 0; i < results.count; i++) {
                 var r = results.get(i);
-                if (r.tick < range.from || r.tick > range.to)
+                if (!inRange(r.track, r.tick, range))
                     kept.push({ bar: r.bar, tick: r.tick, staff: r.staff,
                                 verdict: r.verdict, reason: r.reason, notes: r.notes,
-                                track: r.track, grace: r.grace });
+                                track: r.track, grace: r.grace, tickEnd: r.tickEnd, kind: r.kind });
             }
             results.clear();
             for (var k = 0; k < kept.length; k++) results.append(kept[k]);
@@ -144,23 +307,31 @@ MuseScore {
         rowsScore = curScore.scoreName;
         syncFromScore();                    // keep the highlight on what is selected
 
-        var c = out.counts;
-        statusLine = c.impossible + " unplayable · " + c.outOfReach + " stretch · " +
-                     c.open + " open · " + c.playable + " playable" +
-                     (c.div ? " · " + c.div + " skipped (div.)" : "") +
-                     (c.harmonics ? " · " + c.harmonics + " harmonics (" +
-                                    (c.harmBad + c.harmRisky) + " flagged)" : "") +
-                     (c.jete ? " · " + c.jete + " jeté strokes (" + c.jeteFlagged + " flagged)" : "") +
-                     (c.groups ? " · " + c.groups + " staccato groups (" + c.groupsFlagged + " flagged)" : "") +
-                     (c.slurs ? " · " + c.slurs + " slurs timed (" + c.slursFlagged + " too long)" : "") +
-                     (applied.skipped ? " · " + applied.skipped + " own colour kept" : "") +
-                     (c.covered ? " · " + c.covered + " drawn over MuseScore's range colour" : "");
+        var shown = [];
+        for (var q = 0; q < results.count; q++) shown.push(results.get(q));
+        lastCounts = A.countRows(shown);         // what the table holds, not just this pass
+        updateStatus();
         console.log("PlayabilityChecker live: pass " + passes +
-                    (range ? " bars " + range.from + "–" + range.to : " (whole score)") +
+                    (range ? (range.staves ? " staves " + range.staves.join(",") : " bars " + range.from + "–" + range.to)
+                           : " (whole score)") +
                     (command ? " [undoable]" : " [no undo step]") + " — " + statusLine);
+        // a fast bass run reaches over the edited bars: judge those staves whole
+        if (range && range.from >= 0 && out.redoStaves && out.redoStaves.length)
+            check({ from: -1, to: -1, staves: out.redoStaves }, command);
     }
 
-    function fullCheck(command) { check(null, command, true); }
+    property var lastCounts: null
+    // Problems only; plus a note while a read is running or when slurs may be stale.
+    function updateStatus() {
+        var line = lastCounts ? A.problemSummary(lastCounts) : "";
+        if (statusHint !== "") line += (line ? " · " : "") + statusHint;
+        else if (copyDirty && !copyAuto) line += (line ? " · " : "") + "slurs may be out of date — Re-check";
+        statusLine = line;
+    }
+    onStatusHintChanged: updateStatus()
+
+    // Re-check / Apply: read the copy, then check the whole score.
+    function fullCheck(command) { requestCopy({ full: true, command: command }); }
 
     // Score -> panel: highlight the row for the selected chord, and describe it.
     // Rows and chords name each other by { track, tick, grace } — see analyse.js.
@@ -168,7 +339,7 @@ MuseScore {
         if (!curScore) return;
         var key = A.selectedChord(curScore, env);
         selectedInfo = key ? A.inspectChord(curScore, env, key, circles) : "";
-        geom = key ? A.chordGeometry(curScore, env, key, circles) : null;
+        geom = key && !A.selectionSpansChords(curScore, env) ? A.chordGeometry(curScore, env, key, circles) : null;
         showList = false;
         // a selected note shows MuseScore's selection colour, so uncover it
         if (coverOn && covers.length) {
@@ -176,14 +347,13 @@ MuseScore {
             A.refreshCovers(curScore, env, covers, overlayOpts(false));
             busy = false;
         }
-        var row = -1;
+        // The row for the selected chord: its own row first, else the row of a slur or
+        // stroke the chord belongs to (any note of a flagged slur finds the slur's row).
+        var row = -1, best = 0;
         if (key && curScore.scoreName === rowsScore) {
-            for (var i = 0; i < results.count; i++) {
-                var r = results.get(i);
-                if (r.track === key.track && r.tick === key.tick && r.grace === key.grace) {
-                    row = i;
-                    break;
-                }
+            for (var i = 0; i < results.count && best < 2; i++) {
+                var m = A.rowMatch(results.get(i), key);
+                if (m > best) { best = m; row = i; }
             }
         }
         syncing = true;
@@ -219,7 +389,7 @@ MuseScore {
         syncing = true;
         var r = results.get(row);
         panToChord({ track: r.track, tick: r.tick, grace: r.grace });
-        var found = A.selectChord(curScore, env, r);
+        var found = A.selectRow(curScore, env, r);      // every note the row is about
         syncing = false;
         if (!found) {
             selectedInfo = "that chord has changed since the check — press Re-check";
@@ -227,7 +397,8 @@ MuseScore {
         }
         var key = A.selectedChord(curScore, env);
         selectedInfo = key ? A.inspectChord(curScore, env, key, circles) : "";
-        geom = key ? A.chordGeometry(curScore, env, key, circles) : null;   // rows are never playable
+        geom = key && !A.selectionSpansChords(curScore, env)
+               ? A.chordGeometry(curScore, env, key, circles) : null;
     }
 
     onScoreStateChanged: {
@@ -236,21 +407,34 @@ MuseScore {
         if (!liveOn) return;
         if (curScore.scoreName !== lastScore) {     // switched tab: start over
             lastScore = curScore.scoreName;
-            circles = null;             // the old score's map does not apply here
+            circles = null;             // the old score's maps do not apply here
             bowing = null;
             ranges = null;
+            staffSigs = {};
             covers = [];
-            debounce.range = null;
-            debounce.restart();
+            copyAuto = true;
+            check(null, false);         // notes and texts at once; slurs follow from the copy
+            requestCopy({ full: true });
             return;
         }
-        if (state.instrumentsChanged) ranges = null;    // re-read on the next pass
         // a pure selection change doesn't alter any note
         if (state.selectionChanged && state.startLayoutTick < 0 && !state.instrumentsChanged) return;
-        if (state.startLayoutTick >= 0 && state.endLayoutTick >= state.startLayoutTick)
-            debounce.range = { from: state.startLayoutTick, to: state.endLayoutTick };
-        else
+        copyDirty = true;                            // slurs, dots, hairpins or ranges may have changed
+        if (copyAuto) copyIdle.restart(); else updateStatus();
+        // One edit can arrive as two notifications: one with the changed bars, then one with
+        // no range. Ranges within the debounce window are merged, and a rangeless notification
+        // does not cancel a pending range (it used to turn every keyboard edit into a
+        // whole-score pass).
+        var pending = debounce.running;
+        if (state.startLayoutTick >= 0 && state.endLayoutTick >= state.startLayoutTick) {
+            if (pending && debounce.range)
+                debounce.range = { from: Math.min(debounce.range.from, state.startLayoutTick),
+                                   to: Math.max(debounce.range.to, state.endLayoutTick) };
+            else if (!pending)
+                debounce.range = { from: state.startLayoutTick, to: state.endLayoutTick };
+        } else if (!(pending && debounce.range)) {
             debounce.range = null;                  // unknown extent: re-do everything
+        }
         debounce.restart();
     }
 
@@ -258,16 +442,14 @@ MuseScore {
         id: debounce
         interval: 350
         property var range: null
-        onTriggered: check(range, false)            // live: no undo step
+        onTriggered: check(range, false)            // live: no undo step, current copy maps
     }
 
-    // There is deliberately no timer that scans for harmonic circles. It needs a
-    // select-all, and the selection cannot be handed back intact, so running it
-    // on any automatic schedule fights the person typing.
-
     onRun: {
-        if (curScore) lastScore = curScore.scoreName;
-        fullCheck(false);
+        if (!curScore) return;
+        lastScore = curScore.scoreName;
+        check(null, false);             // notes and texts at once; slurs follow from the copy
+        requestCopy({ full: true });
     }
 
     ColumnLayout {
@@ -286,7 +468,7 @@ MuseScore {
                 onCheckedChanged: {
                     coverOn = checked;
                     if (!checked) { covers = []; ranges = null; }
-                    fullCheck(false);
+                    fullCheck(false);           // re-reads the ranges too
                 }
             }
             CheckBox {
@@ -356,9 +538,9 @@ MuseScore {
                     Rectangle {
                         visible: it.kind === "line" || it.kind === "rect" || it.kind === "circle"
                         x: isLine ? (vertical ? it.x1 - lw / 2 : Math.min(it.x1, it.x2))
-                                  : (it.kind === "circle" ? it.x - it.r : it.x)
+                                  : (it.kind === "circle" ? it.x - it.r : (it.x || 0))
                         y: isLine ? (vertical ? Math.min(it.y1, it.y2) : it.y1 - lw / 2)
-                                  : (it.kind === "circle" ? it.y - it.r : it.y)
+                                  : (it.kind === "circle" ? it.y - it.r : (it.y || 0))
                         width:  isLine ? (vertical ? lw : Math.abs(it.x2 - it.x1))
                                        : (it.kind === "circle" ? it.r * 2 : (it.w || 0))
                         height: isLine ? (vertical ? Math.abs(it.y2 - it.y1) : lw)
@@ -417,7 +599,7 @@ MuseScore {
             spacing: 6
             Button {
                 text: "Re-check"
-                tooltip: "Also rescans harmonic circles from the Articulations palette, and slurs for jeté"
+                tooltip: "Reads the score again (slurs, articulations, hairpins, ranges) and checks every staff"
                 onClicked: fullCheck(false)
             }
             Button {
