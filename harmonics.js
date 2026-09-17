@@ -195,6 +195,34 @@ function inspectNatural(instr, list) {
 }
 
 
+// Fingerboard data for a natural-harmonic chord (same notation rules as inspectNatural):
+// { notes: [{ pitch, name, options: [{ string, partial, sounds, soundsName, solo,
+//   nodes: [{ pitch, name, num, den }] }] }] } — num/den is the node's exact place on the
+// string, measured from the nut (1/2, 1/3, 2/3, ...). null when not a readable natural harmonic.
+function naturalGeometry(instr, list) {
+    if (inspectNatural(instr, list) === null) return null;
+    var atNode = false;
+    for (var i = 0; i < list.length; i++) if (list[i].diamond) atNode = true;
+    var notes = [];
+    for (i = 0; i < list.length; i++) {
+        var opts = naturalOptions(instr, list[i].pitch, atNode), out = [];
+        for (var k = 0; k < opts.length; k++) {
+            var o = opts[k], open = instr.strings[o.string], nodes = [];
+            for (var m = 0; m < o.nodes.length; m++) {
+                var off = o.nodes[m] - open;
+                var num = Math.round(o.partial * (1 - Math.pow(2, -off / 12)));
+                nodes.push({ pitch: o.nodes[m], name: S.noteName(o.nodes[m]), num: num, den: o.partial,
+                             solo: off === SOLO_ONLY });
+            }
+            out.push({ string: o.string, partial: o.partial, sounds: o.sounds,
+                       soundsName: S.noteName(o.sounds), solo: o.solo, nodes: nodes });
+        }
+        notes.push({ pitch: list[i].pitch, name: S.noteName(list[i].pitch), options: out });
+    }
+    return { notes: notes, atNode: atNode };
+}
+
+
 function describeNatural(res, pitch) {
     if (!res.info) return S.noteName(pitch) + " (—)";
     return S.noteName(pitch) + " (" + ROMAN[res.info.string] + ") partial " +

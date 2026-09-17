@@ -1,5 +1,5 @@
 //=============================================================================
-//  Orchestration Checker — live string check
+//  Orchestration Checker — live string check, and the wind register graph (W1)
 //  Keeps checking while you edit. Colours are written straight to the noteheads,
 //  without startCmd/endCmd, so a live pass never pushes an undo step (verified:
 //  see SPEC-strings.md, "Live mode"). Use "Apply to score" for a normal,
@@ -8,7 +8,7 @@
 //  If the dock panel misbehaves in your MuseScore, change pluginType to "dialog"
 //  and delete the dockArea line — everything else works the same.
 //=============================================================================
-import QtQuick 2.2
+import QtQuick 2.4
 import QtQuick.Controls 1.1
 import QtQuick.Layouts 1.1
 import MuseScore 3.0
@@ -17,15 +17,16 @@ import "analyse.js" as A
 import "strings.js" as S
 import "fingerboard.js" as F
 import "copyscan.js" as CS
+import "registergraph.js" as RG
 
 MuseScore {
-    menuPath: "Plugins.Playability Checker.Live check (strings)"
-    description: "Checks bowed-string staves while you edit: open strings, and multiple stops that can't be played."
+    menuPath: "Plugins.Playability Checker"
+    description: "Checks bowed-string staves while you edit (open strings, stops, bowing), and shows the registers of selected wind notes."
     version: "0.2"
     requiresScore: true
     pluginType: "dock"
     dockArea: "right"
-    width: 340
+    width: 300
     height: 520
 
     property var env: ({ CHORD: Element.CHORD, NOTE: Element.NOTE,
@@ -60,7 +61,7 @@ MuseScore {
     //            re-checked.
     property var ranges: null
     property var covers: []             // keys of notes drawn over, for selection changes
-    property bool coverOn: true         // draw our colour over MuseScore's range colours
+    property bool coverOn: true         // always draw our colour over MuseScore's range colours
     property var circles: null          // track -> tick -> true (from the copy)
     property var bowing: null           // { slurs, dots, hairpins } (from the copy)
     property var staffSigs: ({})        // staff -> signature of its maps at the last read
@@ -93,11 +94,14 @@ MuseScore {
         else workerState = -1;
     }
 
-    // Staves that hold a bowed string at any point: the only ones worth scanning.
+    // Staves worth scanning: a bowed string (for the checks) or a known wind (its slurs
+    // join notes in the register graph) at any point.
     function stringStaves() {
         var list = [], staves = A.staffInstruments(curScore);
+        var winds = RG.rgWindStaves(curScore, env);
         for (var st = 0; st < curScore.nstaves; st++) {
             if (!staves[st]) continue;
+            if (winds.indexOf(st) >= 0) { list.push(st); continue; }
             var inst = A.instrumentsOf(curScore, env, st, staves[st].part, null);
             for (var i = 0; i < inst.length; i++) if (inst[i].instr) { list.push(st); break; }
         }
@@ -217,7 +221,7 @@ MuseScore {
         copyIdleMs = job.writeMs <= 50 ? 400 : job.writeMs <= 150 ? 1500 : 5000;
         console.log("PlayabilityChecker copy: write " + job.writeMs + " ms, read " + job.readMs + " ms, ranges " +
                     job.rangeMs + " ms, scan " + scanMs + " ms (" + where + "), " + job.staves.length +
-                    " string staves, changed " + (first ? "all" : changed.length) +
+                    " staves, changed " + (first ? "all" : changed.length) +
                     (copyAuto ? "" : " — automatic reads off for this score (slow copy)"));
         if (job.full || first) check(null, job.command, false);
         else if (changed.length) check({ from: -1, to: -1, staves: changed }, false, false);
@@ -236,7 +240,7 @@ MuseScore {
         return { command: command, overlay: coverOn, env: env,
                  newSymbol: function () { return newElement(Element.SYMBOL); } };
     }
-    property bool liveOn: true
+    property bool liveOn: true          // always on (the panel no longer has a switch)
     property bool busy: false           // re-entry guard: our own writes fire onScoreStateChanged
     property bool syncing: false        // the panel itself is moving a selection
     property bool rebuilding: false     // the results model is being refilled
@@ -244,6 +248,26 @@ MuseScore {
     property string selectedInfo: ""    // the "Selected" line under the table
     property var geom: null             // fingerboard data while a playable chord is selected
     property bool showList: false       // the user asked for the list back
+    property var rgm: null              // register graph model while wind notes are selected (W1)
+    property int rgIndex: 0             // the instrument shown
+    property real rgChipsX: 0           // chip strip scroll position, kept across refreshes
+
+    // The register graph for the current selection. Keeps showing the same instrument
+    // when the same graphs come back (after an edit, or when the slurs arrive).
+    function refreshGraph() {
+        var m = (geom === null && curScore) ? RG.rgModel(curScore, env, bowing, ranges) : null;
+        if (!m) { rgm = null; return; }
+        var keepId = (rgm && rgIndex < rgm.graphs.length) ? rgm.graphs[rgIndex].id : "";
+        var idx = m.first;
+        if (rgm && rgm.key === m.key)
+            for (var i = 0; i < m.graphs.length; i++) if (m.graphs[i].id === keepId) idx = i;
+        rgIndex = idx;
+        rgm = m;
+    }
+    function showGraph(i) {
+        if (!rgm) return;
+        rgIndex = Math.max(0, Math.min(rgm.graphs.length - 1, i));
+    }
 
     property int passes: 0
     property string statusLine: "not run yet"
@@ -286,24 +310,25 @@ MuseScore {
                     keepCovers.push(covers[ci]);
         covers = keepCovers.concat(out.covers);
 
-        // a partial pass only replaces the rows in its own bar range
+        // a partial pass only replaces the rows in its own bar range; the table is then
+        // sorted the way the score reads: by bar first, then by staff.
         rebuilding = true;
-        if (range) {
-            var kept = [];
+        var all = [];
+        if (range)
             for (var i = 0; i < results.count; i++) {
                 var r = results.get(i);
                 if (!inRange(r.track, r.tick, range))
-                    kept.push({ bar: r.bar, tick: r.tick, staff: r.staff,
-                                verdict: r.verdict, reason: r.reason, notes: r.notes,
-                                track: r.track, grace: r.grace, tickEnd: r.tickEnd, kind: r.kind });
+                    all.push({ bar: r.bar, tick: r.tick, staff: r.staff,
+                               verdict: r.verdict, reason: r.reason, notes: r.notes,
+                               track: r.track, grace: r.grace, tickEnd: r.tickEnd, kind: r.kind,
+                               staffShort: r.staffShort });
             }
-            results.clear();
-            for (var k = 0; k < kept.length; k++) results.append(kept[k]);
-        } else {
-            results.clear();
-        }
-        for (var j = 0; j < out.rows.length; j++) results.append(out.rows[j]);
+        for (var j = 0; j < out.rows.length; j++) all.push(out.rows[j]);
+        all.sort(function (a, b) { return (a.tick - b.tick) || (a.track - b.track) || (a.grace - b.grace); });
+        results.clear();
+        for (var k = 0; k < all.length; k++) results.append(all[k]);
         rebuilding = false;
+        fitColumns();
         rowsScore = curScore.scoreName;
         syncFromScore();                    // keep the highlight on what is selected
 
@@ -321,12 +346,30 @@ MuseScore {
     }
 
     property var lastCounts: null
-    // Problems only; plus a note while a read is running or when slurs may be stale.
+
+    // Column widths from the text they hold (see the table below)
+    FontMetrics { id: tableFont }
+    property real barColWidth: 40
+    property real staffColWidth: 50
+    property real reasonColWidth: 200
+    function fitColumns() {
+        var bw = tableFont.advanceWidth("Bar"), sw = tableFont.advanceWidth("Staff"),
+            rw = tableFont.advanceWidth("Reason");
+        for (var i = 0; i < results.count; i++) {
+            var r = results.get(i);
+            bw = Math.max(bw, tableFont.advanceWidth(String(r.bar)));
+            sw = Math.max(sw, tableFont.advanceWidth(String(r.staffShort)));
+            rw = Math.max(rw, tableFont.advanceWidth(String(r.reason)));
+        }
+        barColWidth = Math.ceil(bw) + 18;       // cell padding and the header's sort gap
+        staffColWidth = Math.ceil(sw) + 18;
+        reasonColWidth = Math.ceil(rw) + 18;    // never clipped; the table scrolls sideways instead
+    }
+    // No problem summary: the table lists the problems, one row each (user, 2026-09-17).
+    // The line only says when a read is running or when the slurs may be stale.
     function updateStatus() {
-        var line = lastCounts ? A.problemSummary(lastCounts) : "";
-        if (statusHint !== "") line += (line ? " · " : "") + statusHint;
-        else if (copyDirty && !copyAuto) line += (line ? " · " : "") + "slurs may be out of date — Re-check";
-        statusLine = line;
+        statusLine = statusHint !== "" ? statusHint
+                   : (copyDirty && !copyAuto) ? "slurs may be out of date — Re-check" : "";
     }
     onStatusHintChanged: updateStatus()
 
@@ -340,6 +383,7 @@ MuseScore {
         var key = A.selectedChord(curScore, env);
         selectedInfo = key ? A.inspectChord(curScore, env, key, circles) : "";
         geom = key && !A.selectionSpansChords(curScore, env) ? A.chordGeometry(curScore, env, key, circles) : null;
+        refreshGraph();
         showList = false;
         // a selected note shows MuseScore's selection colour, so uncover it
         if (coverOn && covers.length) {
@@ -390,6 +434,7 @@ MuseScore {
         var r = results.get(row);
         panToChord({ track: r.track, tick: r.tick, grace: r.grace });
         var found = A.selectRow(curScore, env, r);      // every note the row is about
+        if (found === "toEnd") cmd("select-end-score");  // a range to the end of the score
         syncing = false;
         if (!found) {
             selectedInfo = "that chord has changed since the check — press Re-check";
@@ -399,6 +444,7 @@ MuseScore {
         selectedInfo = key ? A.inspectChord(curScore, env, key, circles) : "";
         geom = key && !A.selectionSpansChords(curScore, env)
                ? A.chordGeometry(curScore, env, key, circles) : null;
+        refreshGraph();
     }
 
     onScoreStateChanged: {
@@ -457,48 +503,13 @@ MuseScore {
         anchors.margins: 10
         spacing: 8
 
-        RowLayout {
-            Layout.fillWidth: true
-            Text { text: "Playability Checker — live"; font.pixelSize: 14; font.bold: true }
-            Item { Layout.fillWidth: true }
-            CheckBox {
-                text: "cover"
-                checked: true
-                tooltip: "Draw the plugin's colour over notes MuseScore marks as out of range"
-                onCheckedChanged: {
-                    coverOn = checked;
-                    if (!checked) { covers = []; ranges = null; }
-                    fullCheck(false);           // re-reads the ranges too
-                }
-            }
-            CheckBox {
-                id: liveBox
-                text: "live"
-                checked: true
-                onCheckedChanged: { liveOn = checked; if (checked) fullCheck(false); }
-            }
-        }
-
         Text {
             Layout.fillWidth: true
+            visible: statusLine !== ""
             text: statusLine
             wrapMode: Text.WordWrap
             color: "#444444"
             font.pixelSize: 11
-        }
-
-        RowLayout {
-            spacing: 12
-            Repeater {
-                model: [ { c: S.COLOR.impossible, t: "unplayable" },
-                         { c: S.COLOR.outOfReach, t: "stretch" },
-                         { c: S.COLOR.open,       t: "open string" } ]
-                RowLayout {
-                    spacing: 4
-                    Rectangle { width: 11; height: 11; radius: 2; color: modelData.c }
-                    Text { text: modelData.t; font.pixelSize: 11; color: "#444444" }
-                }
-            }
         }
 
         // The list and the fingerboard share one container and each fill it with anchors,
@@ -567,19 +578,181 @@ MuseScore {
             }
         }
 
+        // W1: while wind notes are selected, their bars as a register graph (one
+        // instrument at a time; chips, arrows or the wheel switch). Same drawing approach
+        // as the fingerboard: a display list of plain Rectangles and Text.
+        Item {
+            id: graphArea
+            anchors.fill: parent
+            visible: rgm !== null && geom === null && !showList
+            clip: true
+
+            Item {
+                id: chipRow
+                anchors.left: parent.left; anchors.right: parent.right; anchors.top: parent.top
+                height: 26
+                ListView {
+                    id: chips
+                    anchors.left: parent.left; anchors.right: arrows.left; anchors.rightMargin: 6
+                    anchors.top: parent.top; anchors.bottom: parent.bottom
+                    orientation: ListView.Horizontal
+                    spacing: 5
+                    clip: true
+                    boundsBehavior: Flickable.StopAtBounds
+                    model: rgm ? rgm.graphs.length : 0
+                    currentIndex: rgIndex
+                    highlightFollowsCurrentItem: false
+                    onCurrentIndexChanged: positionViewAtIndex(currentIndex, ListView.Contain)
+                    onContentXChanged: rgChipsX = contentX
+                    onModelChanged: { contentX = Math.max(0, Math.min(rgChipsX, contentWidth - width)); positionViewAtIndex(rgIndex, ListView.Contain) }
+                    delegate: Rectangle {
+                        property bool on: index === rgIndex
+                        height: 22; y: 2
+                        width: chipText.implicitWidth + 18
+                        radius: 11
+                        color: on ? "#222222" : "#ffffff"
+                        border.color: on ? "#222222" : "#c4c4c4"
+                        Text {
+                            id: chipText
+                            anchors.centerIn: parent
+                            text: rgm && index < rgm.graphs.length ? rgm.graphs[index].chip : ""
+                            font.pixelSize: 11
+                            color: parent.on ? "#ffffff" : "#222222"
+                        }
+                        MouseArea { anchors.fill: parent; onClicked: showGraph(index) }
+                    }
+                    // wheel or trackpad over the chips slides them sideways
+                    MouseArea {
+                        anchors.fill: parent
+                        acceptedButtons: Qt.NoButton
+                        onWheel: {
+                            var dlt = Math.abs(wheel.angleDelta.x) > Math.abs(wheel.angleDelta.y) ? wheel.angleDelta.x : wheel.angleDelta.y;
+                            var max = Math.max(0, chips.contentWidth - chips.width);
+                            chips.contentX = Math.max(0, Math.min(max, chips.contentX - dlt / 2));
+                        }
+                    }
+                }
+                // fades mark the side that has more chips: a few strips of the panel colour,
+                // more opaque towards the edge (QML gradients only run vertically)
+                SystemPalette { id: pal }
+                Row {
+                    visible: chips.contentX > 1
+                    anchors.left: chips.left; anchors.top: chips.top; anchors.bottom: chips.bottom
+                    Repeater {
+                        model: 6
+                        Rectangle { width: 3; height: parent.height; color: pal.window; opacity: 1 - index / 6 }
+                    }
+                }
+                Row {
+                    visible: chips.contentX < chips.contentWidth - chips.width - 1
+                    anchors.right: chips.right; anchors.top: chips.top; anchors.bottom: chips.bottom
+                    Repeater {
+                        model: 6
+                        Rectangle { width: 3; height: parent.height; color: pal.window; opacity: (index + 1) / 6 }
+                    }
+                }
+                Row {
+                    id: arrows
+                    anchors.right: parent.right; anchors.verticalCenter: parent.verticalCenter
+                    spacing: 4
+                    Button { text: "‹"; implicitWidth: 28; enabled: rgIndex > 0; tooltip: "Previous instrument"; onClicked: showGraph(rgIndex - 1) }
+                    Button { text: "›"; implicitWidth: 28; enabled: rgm !== null && rgIndex < rgm.graphs.length - 1; tooltip: "Next instrument"; onClicked: showGraph(rgIndex + 1) }
+                }
+            }
+            Text {
+                anchors.right: parent.right; anchors.top: chipRow.bottom; anchors.topMargin: 2
+                text: rgm ? (rgIndex + 1) + " / " + rgm.graphs.length : ""
+                font.pixelSize: 10; color: "#777777"
+                visible: rgm !== null && rgm.graphs.length > 1
+                z: 2
+            }
+
+            Item {
+                id: graph
+                anchors.left: parent.left; anchors.right: parent.right
+                anchors.top: chipRow.bottom; anchors.bottom: parent.bottom
+                anchors.topMargin: 4
+                property var items: (rgm !== null && width > 0 && height > 0) ? RG.rgLayout(rgm, rgIndex, width, height) : []
+                Repeater {
+                    model: graph.items
+                    delegate: Item {
+                        property var it: modelData
+                        property bool isLine: it.kind === "line"
+                        property bool vertical: isLine && it.x1 === it.x2
+                        property real lw: it.width || 1
+                        Rectangle {
+                            visible: it.kind === "line" || it.kind === "rect"
+                            x: isLine ? (vertical ? it.x1 - lw / 2 : Math.min(it.x1, it.x2)) : (it.x || 0)
+                            y: isLine ? (vertical ? Math.min(it.y1, it.y2) : it.y1 - lw / 2) : (it.y || 0)
+                            width:  isLine ? (vertical ? lw : Math.abs(it.x2 - it.x1)) : (it.w || 0)
+                            height: isLine ? (vertical ? Math.abs(it.y2 - it.y1) : lw) : (it.h || 0)
+                            color: it.kind === "line" ? it.color : (it.fill ? it.fill : "transparent")
+                            opacity: it.opacity !== undefined ? it.opacity : 1
+                            // antialiased only where the display list asks for it (the dynamic
+                            // strip's sloping edge); elsewhere off, so slices meet without seams
+                            antialiasing: it.smooth === true
+                        }
+                        Text {
+                            visible: it.kind === "text"
+                            text: it.text || ""
+                            font.pixelSize: it.size || 10
+                            font.bold: !!it.bold
+                            color: it.color || "#333333"
+                            style: it.halo ? Text.Outline : Text.Normal
+                            styleColor: it.halo || "transparent"
+                            x: it.align === "center" ? it.x - implicitWidth / 2
+                             : it.align === "right" ? it.x - implicitWidth : (it.x || 0)
+                            y: (it.y || 0) - baselineOffset
+                        }
+                    }
+                }
+                // the wheel over the graph changes instrument
+                MouseArea {
+                    anchors.fill: parent
+                    acceptedButtons: Qt.NoButton
+                    property real acc: 0
+                    onWheel: {
+                        if (!rgm) { wheel.accepted = false; return; }
+                        acc += wheel.angleDelta.y;
+                        if (Math.abs(acc) < 120) return;
+                        var to = rgIndex + (acc < 0 ? 1 : -1);
+                        acc = 0;
+                        if (to < 0 || to >= rgm.graphs.length) { wheel.accepted = false; return; }
+                        showGraph(to);
+                    }
+                }
+            }
+        }
+
         TableView {
             id: table
-            visible: geom === null || showList
+            visible: (geom === null && rgm === null) || showList
             anchors.fill: parent
             model: results
             // Deliberately NOT onCurrentRowChanged: that also fires when a live pass
             // refills the model, and would move the selection behind your back.
             onClicked: selectRow(row)
             onActivated: selectRow(row)
-            TableViewColumn { role: "bar";     title: "Bar";    width: 40 }
-            TableViewColumn { role: "staff";   title: "Staff";  width: 80 }
-            TableViewColumn { role: "reason";  title: "Reason"; width: 105 }
-            TableViewColumn { role: "notes";   title: "Notes";  width: 95 }
+            // Bar and Staff are as wide as their longest entry; Reason takes the rest.
+            // The notes themselves are shown by the selection and the fingerboard.
+            // what the row is: a red square for something unplayable, a dark yellow one for a
+            // stretch or a limit that is over — the same two colours the noteheads get
+            TableViewColumn {
+                role: "verdict"; title: ""; width: 20; resizable: false; movable: false
+                delegate: Item {
+                    Rectangle {
+                        anchors.centerIn: parent
+                        width: 10; height: 10; radius: 2
+                        color: styleData.value === "impossible" ? S.COLOR.impossible : S.COLOR.outOfReach
+                    }
+                }
+            }
+            TableViewColumn { role: "bar";        title: "Bar";    width: barColWidth }
+            TableViewColumn { role: "staffShort"; title: "Staff";  width: staffColWidth }
+            // as wide as the longest reason, or the rest of the panel when that is wider;
+            // a horizontal scroll bar appears when the three columns do not fit
+            TableViewColumn { role: "reason";     title: "Reason";
+                              width: Math.max(reasonColWidth, table.viewport.width - barColWidth - staffColWidth - 20) }
         }
         }   // listArea
 
@@ -587,42 +760,33 @@ MuseScore {
             Layout.fillWidth: true
             // redundant under a fingerboard that names its notes; kept with the list, and
             // in a panel too narrow for the diagram's note names
-            visible: selectedInfo !== "" && (geom === null || showList || !board.namesShown || !board.visible)
+            visible: selectedInfo !== "" && !graphArea.visible &&
+                     (geom === null || showList || !board.namesShown || !board.visible)
             text: "Selected: " + selectedInfo
             wrapMode: Text.WordWrap
             font.pixelSize: 11
             color: "#222222"
         }
 
-        RowLayout {
+        // Only what the panel cannot do by itself. "Clear" and "Apply to score" were removed
+        // (user, 2026-09-17): a live pass paints the colours back a moment later, so clearing
+        // did nothing lasting, and the colours are already on the score without an undo step.
+        // Re-check is the one thing still needed, and only on a score whose copy is too slow to
+        // read automatically — the status line then asks for it.
+        Flow {
             Layout.fillWidth: true
             spacing: 6
             Button {
                 text: "Re-check"
-                tooltip: "Reads the score again (slurs, articulations, hairpins, ranges) and checks every staff"
+                visible: !copyAuto
+                tooltip: "This score is slow to read, so slurs and articulations are not picked up automatically. Read it again now."
                 onClicked: fullCheck(false)
             }
             Button {
-                text: "Apply to score"
-                tooltip: "Write the same colours as a normal, undoable edit"
-                onClicked: fullCheck(true)
-            }
-            Item { Layout.fillWidth: true }
-            Button {
-                text: showList ? "Fingerboard" : "List"
-                visible: geom !== null
-                tooltip: "Switch between the fingerboard of the selected chord and the list"
+                text: showList ? (geom !== null ? "Fingerboard" : "Graph") : "List"
+                visible: geom !== null || rgm !== null
+                tooltip: "Switch between the diagram of the selection and the list"
                 onClicked: showList = !showList
-            }
-            Button {
-                text: "Clear"
-                onClicked: {
-                    busy = true;
-                    var n = A.clearMarks(curScore, env, { command: true });
-                    busy = false;
-                    results.clear();
-                    statusLine = "cleared " + n + " notehead" + (n === 1 ? "" : "s");
-                }
             }
         }
     }

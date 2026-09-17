@@ -34,6 +34,30 @@ function barOf(starts, tick) {
 
 // staffIdx -> { part, name }. The instrument itself is resolved per tick, since a
 // staff can change instrument part-way through (see "instrument changes" below).
+// The staff's short name for the narrow Staff column: MuseScore's own short name when the
+// part has one (Vlns., Vc., ...), else an abbreviation of the long name. A trailing number
+// ("Violins I", "Violin 2") is kept.
+var STAFF_ABBR = [[/^violins\b/i, "Vlns."], [/^violin\b/i, "Vln."], [/^violas\b/i, "Vlas."], [/^viola\b/i, "Vla."],
+                  [/^(violoncellos|violoncelli|cellos|celli)\b/i, "Vcs."], [/^(violoncello|cello)\b/i, "Vc."],
+                  [/^(contrabasses|double\s*basses|basses)\b/i, "Cbs."], [/^(contrabass|double\s*bass)\b/i, "Cb."],
+                  // winds, for scores whose parts have no short name
+                  [/^piccolo\b/i, "Picc."], [/^flutes?\b/i, "Fl."], [/^oboes?\b/i, "Ob."], [/^english horn\b/i, "E.H."],
+                  [/^bass clarinet\b/i, "B. Cl."], [/^clarinets?\b/i, "Cl."], [/^contrabassoon\b/i, "Cbsn."], [/^bassoons?\b/i, "Bsn."],
+                  [/^(\w+) saxophone\b/i, "Sax."], [/^horns?\b/i, "Hn."], [/^trumpets?\b/i, "Tpt."],
+                  [/^bass trombone\b/i, "B. Tbn."], [/^trombones?\b/i, "Tbn."], [/^tubas?\b/i, "Tba."]];
+function shortStaffName(part, longName) {
+    var sn = "";
+    try { sn = part.shortName || "" } catch (e) {}
+    if (!sn) try { sn = part.instrumentAtTick(0).shortName || "" } catch (e2) {}
+    if (sn) return sn;
+    var ln = longName || "";
+    for (var i = 0; i < STAFF_ABBR.length; i++) {
+        var m = STAFF_ABBR[i][0].exec(ln);
+        if (m) return STAFF_ABBR[i][1] + ln.substring(m[0].length);
+    }
+    return ln;
+}
+
 function staffInstruments(score) {
     var map = [];
     for (var p = 0; p < score.parts.length; p++) {
@@ -42,7 +66,7 @@ function staffInstruments(score) {
         try { ln = part.longName || part.partName || "" } catch (e) {}
         var first = part.startTrack >> 2, last = part.endTrack >> 2;
         for (var s = first; s < last; s++)
-            map[s] = { part: part, name: ln || ("staff " + (s + 1)) };
+            map[s] = { part: part, name: ln || ("staff " + (s + 1)), short: shortStaffName(part, ln) };
     }
     return map;
 }
@@ -374,7 +398,7 @@ function scanInstruments(score, env, staffIdx, part) {
             try { ln = part.longName || part.partName || "" } catch (e5) {}
         }
         if (prog === null) try { prog = part.midiProgram } catch (e6) {}
-        out.push({ tick: ticks[i], instr: S.lookup(id, ln, prog) });
+        out.push({ tick: ticks[i], instr: S.lookup(id, ln, prog), id: id, name: ln });
     }
     return out;
 }
@@ -694,6 +718,10 @@ function analyse(score, env, range, circles, ranges, bowing) {
         if (bowing) checkJete(st, info, instrList, markNote, walked);
         if (bowing && bowing.tremolos) checkTremolos(st, info, instrList, markNote, walked);
         checkFastRuns(st, info, instrList, markNote);
+    }
+    for (var ri = 0; ri < rows.length; ri++) {
+        var sinfo = staves[rows[ri].track >> 2];
+        rows[ri].staffShort = sinfo ? sinfo.short : rows[ri].staff;
     }
     return { rows: rows, marks: marks, counts: counts, covers: covers,
              textsChanged: from >= 0 && _textsChanged, redoStaves: redoStaves };
@@ -1165,20 +1193,45 @@ function selectChord(score, env, row) {
     return true;
 }
 
-// Select everything a results row is about: every note of its chord, or — for a
-// stroke row (a slur or jeté stroke) — every note of every chord from its
-// first chord to tickEnd, grace notes included. Returns false if the first chord has
-// gone.
-function selectRow(score, env, row) {
-    var end = row.tickEnd === undefined ? row.tick : row.tickEnd;
-    if (row.grace >= 0 || end <= row.tick) return selectChord(score, env, row);
-    if (!findChord(score, env, row.track, row.tick, -1)) return false;
+// Select everything a results row is about: from the row's chord to the end of the last
+// chord it covers (tickEnd — a stroke's last chord or the note tied on from it). Where no
+// other voice of that staff has notes in that span, as a RANGE selection so MuseScore
+// draws its blue box; otherwise note by note (no box), because a range would take the
+// other voice too and MuseScore's selection filter cannot be set from a plugin.
+// A grace-note row keeps a plain note selection (a range cannot start on a grace note).
+// The range's element list only fills in after the score updates, hence the empty
+// command. Returns false if the row's chord has gone, "toEnd" when the row runs to the
+// end of the score: a range cannot end there (selectRange ends on the segment left of
+// its end tick), so the first chord is selected and the caller runs "select-end-score".
+// Does another voice of this staff have a chord sounding in [from, to)?
+function otherVoiceBetween(score, env, track, from, to) {
+    var st = track >> 2;
+    for (var v = 0; v < 4; v++) {
+        if (st * 4 + v === track) continue;
+        var cur = score.newCursor();
+        cur.staffIdx = st; cur.voice = v;
+        cur.rewind(0);
+        while (cur.segment && cur.tick < to) {
+            var el = cur.element;
+            if (el && el.type === env.CHORD) {
+                var len = 0;
+                try { len = el.actualDuration.ticks } catch (e) {}
+                if (cur.tick + len > from) return true;
+            }
+            cur.next();
+        }
+    }
+    return false;
+}
+
+// Every note of every chord of the row's voice from row.tick to endTick, grace notes included.
+function selectRowNotes(score, env, row, endTick) {
     var cur = score.newCursor(), s = score.selection, first = true;
     cur.staffIdx = row.track >> 2;
     cur.voice = row.track % 4;
     seek(cur, row.tick);
     s.clear();
-    while (cur.segment && cur.tick <= end) {
+    while (cur.segment && cur.tick <= endTick) {
         var el = cur.element;
         if (el && el.type === env.CHORD && cur.tick >= row.tick) {
             var parts = [], gs = null;
@@ -1194,6 +1247,25 @@ function selectRow(score, env, row) {
         cur.next();
     }
     return !first;
+}
+
+function selectRow(score, env, row) {
+    if (row.grace >= 0) return selectChord(score, env, row);
+    if (!findChord(score, env, row.track, row.tick, -1)) return false;
+    var endTick = row.tickEnd === undefined ? row.tick : row.tickEnd;
+    var last = findChord(score, env, row.track, endTick, -1), end = endTick + 1;
+    try { end = endTick + last.actualDuration.ticks } catch (e) {}
+    if (otherVoiceBetween(score, env, row.track, row.tick, end)) return selectRowNotes(score, env, row, endTick);
+    var scoreEnd = -1;
+    try { scoreEnd = score.lastSegment.tick } catch (e3) {}
+    if (scoreEnd >= 0 && end >= scoreEnd) {
+        selectChord(score, env, row);
+        return "toEnd";
+    }
+    var st = row.track >> 2;
+    score.selection.selectRange(row.tick, end, st, st + 1);
+    try { score.startCmd(); score.endCmd(); } catch (e2) {}
+    return true;
 }
 
 // How well a results row matches a selected chord key: 2 = the row's own chord,
@@ -1320,8 +1392,24 @@ function chordGeometry(score, env, key, circles) {
     var instr = instrAt(instrumentsOf(score, env, st, info.part, here), key.tick);
     if (!instr) return null;
     var ns = key.chord.notes;
-    if (!ns || ns.length < 2) return null;
+    if (!ns || !ns.length) return null;
     var chordCircle = mapHas(circles, key.track, key.tick);
+    var names = [], hlist = [], anyH = chordCircle;
+    for (var j = 0; j < instr.strings.length; j++) names.push(S.stringName(instr.strings[j]));
+    for (var h = 0; h < ns.length; h++) {
+        var d = ns[h].headGroup === env.DIAMOND, c = chordCircle || H.hasCircle(ns[h]);
+        if (d || c) anyH = true;
+        hlist.push({ note: ns[h], pitch: ns[h].pitch, diamond: d, circle: c });
+    }
+    // a natural harmonic: every string it can be played on, on a full-length string
+    if (anyH) {
+        var hv = H.classify(instr, hlist);
+        var hg = hv && hv.verdict !== "impossible" ? H.naturalGeometry(instr, hlist) : null;
+        if (!hg) return null;
+        return { kind: "harmonic", instrument: instr.name, strings: instr.strings.slice(0),
+                 stringNames: names, notes: hg.notes, atNode: hg.atNode };
+    }
+    if (ns.length < 2) return null;
     var pitches = [];
     for (var i = 0; i < ns.length; i++) {
         if (ns[i].headGroup === env.DIAMOND || chordCircle || H.hasCircle(ns[i])) return null;
